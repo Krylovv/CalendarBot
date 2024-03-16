@@ -1,0 +1,16 @@
+{"weekday":
+  {
+    "splitter": 18,
+    "price": [3100, 3600]
+  },
+  "friday":
+  {
+      "splitter": 18,
+      "price": [3100, 4200]
+  },
+  "weekend":
+  {
+    "splitter": 16,
+    "price": [3600, 4200]
+  }
+}
