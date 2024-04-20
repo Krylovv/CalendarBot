@@ -8,35 +8,40 @@ class Parser:
 
     def parse(self):
         result_dict = {}
-        message = ''
         required = ['date', 'time', 'hours', 'people', 'Input', 'name']
         # Парсинг словаря из текстового сообщения
-        print("1")
         for line in self.text.split('\n'):
             for item in required:
                 if item + ':' in line:
                     output = line.split(':')
                     result_dict[output[0]] = output[1][1:]
         # Форматирование даты под %Y-%m-%d
-        print("2")
-        result_dict['date'] = result_dict['date'].split('-')[2] + '-' + result_dict['date'].split('-')[1] + '-' + result_dict['date'].split('-')[0]
-
+        result_dict['date'] = result_dict['date'].split('-')[2] + '-' + \
+            result_dict['date'].split('-')[1] + '-' + result_dict['date'].split('-')[0]
         # Функция подсчета суммы
         summ = self.get_summ(result_dict)
-        print("3")
         result_dict['summ'] = str(summ)
         # Блок форматирования словаря под datetime формат и проверки времени работы
-        if ':' or '-' or ' ' not in result_dict['time']:
-            end = int(result_dict['time']) + int(result_dict['hours'])
-            result_dict['endtime'] = str(end)+':00:00'
-            if end <= 23:
-                pass
-            else:
-                print('Аренда выходит за рамки рабочего дня')
-            result_dict['time'] = result_dict['time']+':00:00'
+        rent_start = datetime.datetime.strptime(result_dict['date'] + " " + result_dict['time'], '%Y-%m-%d %H')
+        rent_end = rent_start + datetime.timedelta(hours=int(result_dict['hours']))
+        result_dict['end_date'] = str(rent_end.date())
+        result_dict['end_time'] = str(rent_end.time())
+        result_dict['comment'] = self.check_working_hours(rent_start, rent_end)
+        result_dict['time'] = result_dict['time'] + ':00:00'
         return result_dict
 
-    def get_summ(self, result_dict):
+    @staticmethod
+    def check_working_hours(rent_start, rent_end):
+        start_work_time = datetime.time(10, 0, 0)
+        end_work_time = datetime.time(23, 0, 0)
+        if start_work_time <= rent_start.time() <= end_work_time and \
+                start_work_time <= rent_end.time() <= end_work_time:
+            return ''
+        else:
+            return 'Аренда выходит за рамки рабочего дня'
+
+    @staticmethod
+    def get_summ(result_dict):
         with open('tarification.json', 'r') as tarifs:
             tariffication_dict = json.load(tarifs)
         in_date = result_dict['date']
@@ -50,7 +55,6 @@ class Parser:
         else:
             day = "weekend"
         pricing = tariffication_dict[day]
-        print("BREAK")
         hours_counter = 0
         result_price = 0
         while hours_counter < hours:
@@ -60,5 +64,4 @@ class Parser:
             else:
                 result_price += pricing['price'][1]
                 hours_counter += 1
-        print(result_price)
         return result_price
