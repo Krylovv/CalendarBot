@@ -34,7 +34,7 @@ class Calendar:
                 "summary": result_dict['name'] + " (не обработана)",
                 "description": result_dict['Input'] + '\n' + result_dict['people'] +
                                ' человек ' + '\n' + 'Сумма ' + result_dict['summ'] +
-                               'р' + '\n\n' + result_dict['comment'],
+                               'р' + '\n' + result_dict['comment'],
                 "start": {
                     "dateTime": result_dict['date'] + 'T' + result_dict['time'] + '+03:00',
                     "timeZone": "Europe/Moscow"
@@ -49,8 +49,12 @@ class Calendar:
         except HttpError as error:
             print(f"An error occurred: {error}")
 
-    def get_events(self):
-        # TODO проработать взаимодействие с ботом
+    # Функция получения аренд следующей недели
+    def get_events_for_next_week(self):
+        # Получаем дату следующего понедельника
+        next_monday = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7)
+        # Получаем дату следующего воскресенья
+        next_sunday = next_monday + datetime.timedelta(days=(6 - next_monday.weekday()) % 7)
         try:
             service = build("calendar", "v3", credentials=self.creds)
             now = datetime.datetime.utcnow().isoformat() + "Z"
@@ -58,28 +62,26 @@ class Calendar:
                 service.events()
                 .list(
                     calendarId="primary",
-                    timeMin=now,
-                    maxResults=10,
+                    timeMin=str(next_monday) + 'T00:00:00Z',
+                    timeMax=str(next_sunday) + 'T00:00:00Z',
+                    maxResults=1000,
                     singleEvents=True,
                     orderBy="startTime",
                 )
                 .execute()
             )
             events = events_result.get("items", [])
-            print(events)
             if not events:
                 print("No upcoming events found.")
                 return
 
-            # Prints the start and name of the next 10 events
-            for event in events:
-                start = event["start"].get("dateTime", event["start"].get("date"))
-                print(start, event["summary"])
-
+            # for event in events:
+            #     start = event["start"].get("dateTime", event["start"].get("date"))
+            #     print(start, event["summary"])
             return events
         except HttpError as error:
             print(f"An error occurred: {error}")
 
 
-# Функция получения аренд следующей недели
 # Функция получения необработанных аренд имя + дата/время + ник тг + описание + сумма
+# Посчитать аренды за месяц
