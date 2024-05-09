@@ -30,6 +30,8 @@ class Calendar:
     def create_event(self, result_dict):
         try:
             service = build("calendar", "v3", credentials=self.creds)
+            if self.event_intersects(result_dict):
+                result_dict['comment'] += '\nАренда пересекается с другими событиями'
             event = {
                 "summary": result_dict['name'] + " (не обработана)",
                 "description": result_dict['Input'] + '\n' + result_dict['people'] +
@@ -53,6 +55,7 @@ class Calendar:
     def get_events_for_next_week(self):
         # Получаем дату следующего понедельника
         next_monday = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7)
+        print(str(next_monday))
         # Получаем дату следующего воскресенья
         next_sunday = next_monday + datetime.timedelta(days=(6 - next_monday.weekday()) % 7)
         try:
@@ -82,6 +85,50 @@ class Calendar:
         except HttpError as error:
             print(f"An error occurred: {error}")
 
+    def get_event_on_date(self, day):
+        try:
+            service = build("calendar", "v3", credentials=self.creds)
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            events_result = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=str(day) + 'T00:00:00Z',
+                    timeMax=str(day) + 'T23:59:59Z',
+                    maxResults=1000,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            events = events_result.get("items", [])
+            if not events:
+                print("No upcoming events found.")
+                return
 
+            # for event in events:
+            #     start = event["start"].get("dateTime", event["start"].get("date"))
+            #     print(start, event["summary"])
+            return events
+        except HttpError as error:
+            print(f"An error occurred: {error}")
+
+    def event_intersects(self, event_dict):
+        events = self.get_event_on_date(event_dict['date'])
+        for event in events:
+
+            start = datetime.datetime.strptime(event['start']['dateTime'][:-6], '%Y-%m-%dT%H:%M:%S')
+            end = datetime.datetime.strptime(event['end']['dateTime'][:-6], '%Y-%m-%dT%H:%M:%S')
+            print(event_dict['time'])
+            new_event = datetime.datetime.strptime(event_dict['date'] + " " + event_dict['time'], '%Y-%m-%d %H:%M:%S')
+            print(event)
+            if start <= new_event <= end:
+                return True
+        return False
+# В общем виде понять как менять записи https://developers.google.com/calendar/api/v3/reference/events/update
+# Добавлять #automated или типо того для авто записей первой строкой
+# Делать проверку на наличие #automated для будущей работы, не #automated не трогать
 # Функция получения необработанных аренд имя + дата/время + ник тг + описание + сумма
+# Функция перевода необработанных аренд в обработанные
 # Посчитать аренды за месяц
+# Продумать функционал скидки
