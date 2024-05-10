@@ -34,7 +34,7 @@ class Calendar:
                 result_dict['comment'] += '\nАренда пересекается с другими событиями'
             event = {
                 "summary": result_dict['name'] + " (не обработана)",
-                "description": result_dict['Input'] + '\n' + result_dict['people'] +
+                "description": '#automated' + '\n' + result_dict['Input'] + '\n' + result_dict['people'] +
                                ' человек ' + '\n' + 'Сумма ' + result_dict['summ'] +
                                'р' + '\n' + result_dict['comment'],
                 "start": {
@@ -55,12 +55,10 @@ class Calendar:
     def get_events_for_next_week(self):
         # Получаем дату следующего понедельника
         next_monday = datetime.date.today() + datetime.timedelta(days=(0 - datetime.date.today().weekday()) % 7)
-        print(str(next_monday))
         # Получаем дату следующего воскресенья
         next_sunday = next_monday + datetime.timedelta(days=(6 - next_monday.weekday()) % 7)
         try:
             service = build("calendar", "v3", credentials=self.creds)
-            now = datetime.datetime.utcnow().isoformat() + "Z"
             events_result = (
                 service.events()
                 .list(
@@ -78,9 +76,6 @@ class Calendar:
                 print("No upcoming events found.")
                 return
 
-            # for event in events:
-            #     start = event["start"].get("dateTime", event["start"].get("date"))
-            #     print(start, event["summary"])
             return events
         except HttpError as error:
             print(f"An error occurred: {error}")
@@ -106,9 +101,6 @@ class Calendar:
                 print("No upcoming events found.")
                 return
 
-            # for event in events:
-            #     start = event["start"].get("dateTime", event["start"].get("date"))
-            #     print(start, event["summary"])
             return events
         except HttpError as error:
             print(f"An error occurred: {error}")
@@ -119,12 +111,44 @@ class Calendar:
 
             start = datetime.datetime.strptime(event['start']['dateTime'][:-6], '%Y-%m-%dT%H:%M:%S')
             end = datetime.datetime.strptime(event['end']['dateTime'][:-6], '%Y-%m-%dT%H:%M:%S')
-            print(event_dict['time'])
             new_event = datetime.datetime.strptime(event_dict['date'] + " " + event_dict['time'], '%Y-%m-%d %H:%M:%S')
-            print(event)
             if start <= new_event <= end:
                 return True
         return False
+
+    def get_untreated_rents(self):
+        # Получаем дату следующего понедельника
+        start = datetime.date.today()
+        # Получаем дату следующего воскресенья
+        end = start + datetime.timedelta(days=180)
+        try:
+            service = build("calendar", "v3", credentials=self.creds)
+            events_result = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=str(start) + 'T00:00:00Z',
+                    timeMax=str(end) + 'T00:00:00Z',
+                    maxResults=1000,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            tmp_events = events_result.get("items", [])
+
+            if not tmp_events:
+                print("Необработанных аренд не найдено")
+                return
+            events = []
+            for event in tmp_events:
+                if "не обработана" in str(event["summary"]).lower():
+                    events.append(event)
+            return events
+        except HttpError as error:
+            print(f"An error occurred: {error}")
+
+
 # В общем виде понять как менять записи https://developers.google.com/calendar/api/v3/reference/events/update
 # Добавлять #automated или типо того для авто записей первой строкой
 # Делать проверку на наличие #automated для будущей работы, не #automated не трогать

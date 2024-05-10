@@ -17,9 +17,9 @@ class Bot:
         def start(message):
             if str(message.from_user.id) in self.ids:
                 c1 = types.BotCommand(command='next_week_rents', description='Посмотреть аренды на следующую неделю')
-                # c2 = types.BotCommand(command='help', description='Click for Help')
+                c2 = types.BotCommand(command='untreated_rents', description='Посмотреть необработанные аренды')
                 # c3 = types.BotCommand(command='go', description='Something')
-                self.bot.set_my_commands([c1])
+                self.bot.set_my_commands([c1, c2])
                 self.bot.set_chat_menu_button(message.chat.id, types.MenuButtonCommands('commands'))
                 self.bot.send_message(message.chat.id,
                                       text="Привет! Я бот для автоматизации гугл календаря!".format(
@@ -34,23 +34,55 @@ class Bot:
                 try:
                     calendar = Calendar()
                     events_list = calendar.get_events_for_next_week()
-                    response_list = []
                     response = ''
                     for event in events_list:
                         date = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[0]
                         date = date.split('-')[2] + '-' + date.split('-')[1] + '-' + date.split('-')[0]
                         time_start = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[1]
                         time_end = event["end"].get("dateTime", event["end"].get("date"))[:-9].split('T')[1]
-                        response += str((event["summary"] + '\n' +
-                                         date + '\n' + time_start + ' - ' + time_end + '\n' +
-                                         event["description"].split('\n')[0] + '\n' +
-                                         event["description"].split('\n')[3] + '\n\n'))
+
+                        response += str(event["summary"] + '\n' +
+                                         date + '\n' + time_start + ' - ' + time_end + '\n')
+                        try:
+                            response += str(event["description"].split('\n')[1] + '\n' +
+                                            event["description"].split('\n')[3] + '\n')
+                        except Exception:
+                            pass
+                        response += '\n'
                     self.bot.reply_to(message, response)
                 except Exception:
                     self.bot.reply_to(message, "Тут какая-то ошибка")
             else:
                 self.bot.reply_to(message, "Этот бот не предназначен для общего пользования. " +
                                            "Пожалуйста, напишите своего и пользуйтесь")
+
+        @self.bot.message_handler(commands=['untreated_rents'])
+        def get_untreated_rents(message):
+            if str(message.from_user.id) in self.ids:
+                try:
+                    calendar = Calendar()
+                    events_list = calendar.get_untreated_rents()
+                    response = ''
+                    for event in events_list:
+                        date = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[0]
+                        date = date.split('-')[2] + '-' + date.split('-')[1] + '-' + date.split('-')[0]
+                        time_start = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[1]
+                        time_end = event["end"].get("dateTime", event["end"].get("date"))[:-9].split('T')[1]
+
+                        response += str(event["summary"] + '\n' +
+                                        date + '\n' + time_start + ' - ' + time_end + '\n')
+                        try:
+                            response += str(event["description"].split('\n')[1] + '\n' +
+                                            event["description"].split('\n')[3] + '\n')
+                        except Exception:
+                            pass
+                        response += '\n'
+                    self.bot.reply_to(message, response)
+                except Exception:
+                    self.bot.reply_to(message, "Тут какая-то ошибка")
+            else:
+                self.bot.reply_to(message, "Этот бот не предназначен для общего пользования. " +
+                                  "Пожалуйста, напишите своего и пользуйтесь")
 
         @self.bot.message_handler(content_types=['text'])
         def get_text_messages(message):
