@@ -1,6 +1,6 @@
 import json
 import datetime
-
+import yaml
 
 class Parser:
     def __init__(self, text):
@@ -28,6 +28,7 @@ class Parser:
         result_dict['end_time'] = str(rent_end.time())
         result_dict['comment'] = self.check_working_hours(rent_start, rent_end)
         result_dict['time'] = result_dict['time'] + ':00:00'
+        result_dict['description'] = self.description(result_dict)
         return result_dict
 
     @staticmethod
@@ -65,3 +66,32 @@ class Parser:
                 result_price += pricing['price'][1]
                 hours_counter += 1
         return result_price
+
+    @staticmethod
+    def description(result_dict):
+        try:
+            tg = result_dict['Input']
+            people = result_dict['people']
+            summ = result_dict['summ']
+            comment = result_dict['comment']
+            d = f'"type": "automated", "tg": "{tg}", "people": {people}, "summ": {summ}, "comment": "{comment}"'
+            d = '{' + d + '}'
+            d = json.loads(d)
+            s = ''
+            for key in d:
+                s += key + ': ' + str(d[key]) + '\n'
+            return s
+        except Exception:
+            return
+
+    @staticmethod
+    def get_monthly_rent_income(descriptions):
+        summ = 0
+        try:
+            for description in descriptions:
+                for line in description.split('\n'):
+                    if 'summ' in line:
+                        summ += int(line.split(':')[1][1:])
+            return summ
+        except Exception:
+            return

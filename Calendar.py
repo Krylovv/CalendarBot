@@ -1,6 +1,6 @@
 import datetime
 import os.path
-
+import calendar
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -30,13 +30,14 @@ class Calendar:
     def create_event(self, result_dict):
         try:
             service = build("calendar", "v3", credentials=self.creds)
-            if self.event_intersects(result_dict):
-                result_dict['comment'] += '\nАренда пересекается с другими событиями'
+            try:
+                if self.event_intersects(result_dict):
+                    result_dict['comment'] += ', Аренда пересекается с другими событиями'
+            except:
+                pass
             event = {
                 "summary": result_dict['name'] + " (не обработана)",
-                "description": '#automated' + '\n' + result_dict['Input'] + '\n' + result_dict['people'] +
-                               ' человек ' + '\n' + 'Сумма ' + result_dict['summ'] +
-                               'р' + '\n' + result_dict['comment'],
+                "description": result_dict['description'],
                 "start": {
                     "dateTime": result_dict['date'] + 'T' + result_dict['time'] + '+03:00',
                     "timeZone": "Europe/Moscow"
@@ -58,6 +59,7 @@ class Calendar:
         # Получаем дату следующего воскресенья
         next_sunday = next_monday + datetime.timedelta(days=(6 - next_monday.weekday()) % 7)
         try:
+            print(next_sunday)
             service = build("calendar", "v3", credentials=self.creds)
             events_result = (
                 service.events()
@@ -148,11 +150,38 @@ class Calendar:
         except HttpError as error:
             print(f"An error occurred: {error}")
 
-
-# В общем виде понять как менять записи https://developers.google.com/calendar/api/v3/reference/events/update
-# Добавлять #automated или типо того для авто записей первой строкой
-# Делать проверку на наличие #automated для будущей работы, не #automated не трогать
-# Функция получения необработанных аренд имя + дата/время + ник тг + описание + сумма
-# Функция перевода необработанных аренд в обработанные
+    def get_rents_for_month(self, month):
+        current_year = datetime.datetime.now().year
+        start = datetime.datetime.strptime('01-' + str(month) + '-' + str(current_year), '%d-%m-%Y').date()
+        end = datetime.datetime.strptime(str(calendar.monthrange(current_year, month)[1]) + '-' +
+                                         str(month) + '-' + str(current_year), '%d-%m-%Y').date()
+        try:
+            service = build("calendar", "v3", credentials=self.creds)
+            events_result = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=str(start) + 'T00:00:00Z',
+                    timeMax=str(end) + 'T00:00:00Z',
+                    maxResults=1000,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            events = events_result.get("items", [])
+            if not events:
+                print("No upcoming events found.")
+                return
+            descriptions_list = []
+            for event in events:
+                if 'description' in event:
+                    descriptions_list.append(event['description'])
+            return descriptions_list
+        except HttpError as error:
+            print(f"An error occurred: {error}")
+# Вытащить description в отельный метод парсера и оборачивать его в yaml или json
 # Посчитать аренды за месяц
 # Продумать функционал скидки
+# Функция перевода необработанных аренд в обработанные??
+# Делать проверку на наличие #automated для будущей работы, не #automated не трогать???
