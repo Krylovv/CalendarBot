@@ -1,16 +1,13 @@
 from Bot import Bot
+from threading import Thread
+from Spreadsheet import Spreadsheets
 
 
 def main():
     bot = Bot()
-    bot.bot_func()
-
-
-# Сделать проверку пересечений с другими арендами
-# Разобраться с токеном
-# Потестить интеграцию с тильдой
-# Понять как писать в нужный календарь
-# Перенести все креды в один json
+    sh = Spreadsheets()
+    Thread(target=bot.bot_func).start()
+    Thread(target=sh.spreadsheet_to_calendar).start()
 
 
 if __name__ == "__main__":

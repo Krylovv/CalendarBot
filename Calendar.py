@@ -1,32 +1,11 @@
 import datetime
-import os.path
 import calendar
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from GoogleApi import GoogleApi
 
 
-class Calendar:
-    def __init__(self):
-        self.creds = None
-        if os.path.exists("token.json"):
-            self.creds = Credentials.from_authorized_user_file("token.json", self.SCOPES)
-        # If there are no (valid) credentials available, let the user log in.
-        if not self.creds or not self.creds.valid:
-            if self.creds and self.creds.expired and self.creds.refresh_token:
-                self.creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    # Записанные credentials, по которым мы получаем токен
-                    "desktop_creds.json", self.SCOPES
-                )
-                self.creds = flow.run_local_server(port=0)
-            with open("token.json", "w") as token:
-                token.write(self.creds.to_json())
-    SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
+class Calendar(GoogleApi):
     def create_event(self, result_dict):
         try:
             service = build("calendar", "v3", credentials=self.creds)
@@ -59,7 +38,6 @@ class Calendar:
         # Получаем дату следующего воскресенья
         next_sunday = next_monday + datetime.timedelta(days=(6 - next_monday.weekday()) % 7)
         try:
-            print(next_sunday)
             service = build("calendar", "v3", credentials=self.creds)
             events_result = (
                 service.events()
@@ -180,8 +158,5 @@ class Calendar:
             return descriptions_list
         except HttpError as error:
             print(f"An error occurred: {error}")
-# Вытащить description в отельный метод парсера и оборачивать его в yaml или json
-# Посчитать аренды за месяц
-# Продумать функционал скидки
-# Функция перевода необработанных аренд в обработанные??
-# Делать проверку на наличие #automated для будущей работы, не #automated не трогать???
+
+

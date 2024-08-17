@@ -2,15 +2,15 @@ import telebot
 from telebot import types
 from Parser import Parser
 from Calendar import Calendar
-
+import time
 
 class Bot:
     def __init__(self):
-        with open('bot_token', 'r') as secret:
+        with open('secrets/bot_token', 'r') as secret:
             self.token = secret.read()
-        with open('telegram_ids', 'r') as f:
+        with open('secrets/telegram_ids', 'r') as f:
             self.ids = f.read()
-        self.bot = telebot.TeleBot(self.token)
+        self.bot = telebot.TeleBot(self.token, threaded=False)
 
     def bot_func(self):
         @self.bot.message_handler(commands=['start'])
@@ -20,7 +20,6 @@ class Bot:
                 c2 = types.BotCommand(command='untreated_rents', description='Посмотреть необработанные аренды')
                 c3 = types.BotCommand(command='monthly_income', description='Получить сумму аренд за месяц')
                 self.bot.set_my_commands([c1, c2, c3])
-                self.bot.set_chat_menu_button(message.chat.id, types.MenuButtonCommands('commands'))
                 self.bot.send_message(message.chat.id,
                                       text="Привет! Я бот для автоматизации гугл календаря!".format(
                                       message.from_user))
@@ -35,20 +34,23 @@ class Bot:
                     calendar = Calendar()
                     events_list = calendar.get_events_for_next_week()
                     response = ''
-                    for event in events_list:
-                        date = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[0]
-                        date = date.split('-')[2] + '-' + date.split('-')[1] + '-' + date.split('-')[0]
-                        time_start = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[1]
-                        time_end = event["end"].get("dateTime", event["end"].get("date"))[:-9].split('T')[1]
+                    if events_list:
+                        for event in events_list:
+                            date = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[0]
+                            date = date.split('-')[2] + '-' + date.split('-')[1] + '-' + date.split('-')[0]
+                            time_start = event["start"].get("dateTime", event["start"].get("date"))[:-9].split('T')[1]
+                            time_end = event["end"].get("dateTime", event["end"].get("date"))[:-9].split('T')[1]
 
-                        response += str(event["summary"] + '\n' +
-                                         date + '\n' + time_start + ' - ' + time_end + '\n')
-                        try:
-                            response += str(event["description"].split('\n')[1] + '\n' +
-                                            event["description"].split('\n')[3] + '\n')
-                        except Exception:
-                            pass
-                        response += '\n'
+                            response += str(event["summary"] + '\n' +
+                                             date + '\n' + time_start + ' - ' + time_end + '\n')
+                            try:
+                                response += str(event["description"].split('\n')[1] + '\n' +
+                                                event["description"].split('\n')[3] + '\n')
+                            except Exception:
+                                pass
+                            response += '\n'
+                    else:
+                        response = 'На следующей неделе аренд нет'
                     self.bot.reply_to(message, response)
                 except Exception:
                     self.bot.reply_to(message, "Тут какая-то ошибка")
@@ -122,12 +124,15 @@ class Bot:
                     except Exception:
                         self.bot.reply_to(message, "Чет сломалось, я хз(")
                 else:
-                    self.bot.reply_to(message, "Это блин не заявка на аренду")
                     pass
             else:
                 self.bot.reply_to(message, "Этот бот не предназначен для общего пользования. " +
                                            "Пожалуйста, напишите своего и пользуйтесь")
 
-        self.bot.polling(none_stop=True, interval=0)
+        while True:
+            try:
+                self.bot.polling(none_stop=True, interval=0)
 
-# TODO Вынести проверку пользователя
+            except Exception as e:
+                print(e)
+                time.sleep(15)

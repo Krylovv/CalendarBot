@@ -8,7 +8,7 @@ class Parser:
 
     def parse(self):
         result_dict = {}
-        required = ['date', 'time', 'hours', 'people', 'Input', 'name']
+        required = ['date', 'time', 'hours', 'people', 'tg', 'name']
         # Парсинг словаря из текстового сообщения
         for line in self.text.split('\n'):
             for item in required:
@@ -70,7 +70,7 @@ class Parser:
     @staticmethod
     def description(result_dict):
         try:
-            tg = result_dict['Input']
+            tg = result_dict['tg']
             people = result_dict['people']
             summ = result_dict['summ']
             comment = result_dict['comment']
