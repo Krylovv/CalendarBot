@@ -61,7 +61,7 @@ class Spreadsheets(GoogleApi):
             for application in self.get_applications():
                 counter += 1
                 if len(application) < 16:
-                    txt = 'name: ' + application[0] + '\nInput: ' + application[1] + '\ndate: ' + application[4] + \
+                    txt = 'name: ' + application[0] + '\ntg: ' + application[1] + '\ndate: ' + application[4] + \
                           '\ntime: ' + application[5] + '\nhours: ' + application[6] + '\npeople: ' + application[7]
                     untreated_events_list.append(txt)
                     self.update_values('P' + str(counter), 'USER_ENTERED', ['True'])
