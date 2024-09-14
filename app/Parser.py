@@ -1,6 +1,6 @@
 import json
 import datetime
-import yaml
+
 
 class Parser:
     def __init__(self, text):
