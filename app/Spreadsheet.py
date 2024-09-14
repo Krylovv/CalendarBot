@@ -7,7 +7,7 @@ from time import sleep
 
 
 class Spreadsheets(GoogleApi):
-    with open('secrets/spreadsheet_id', 'r') as secret:
+    with open('./secrets/spreadsheet_id', 'r') as secret:
         spreadsheet_id = secret.read()
     SPREADSHEET_ID = spreadsheet_id
     RANGE_NAME = "A1:P999"

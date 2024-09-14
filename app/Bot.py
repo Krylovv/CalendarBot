@@ -6,9 +6,9 @@ import time
 
 class Bot:
     def __init__(self):
-        with open('secrets/bot_token', 'r') as secret:
+        with open('./secrets/bot_token', 'r') as secret:
             self.token = secret.read()
-        with open('secrets/telegram_ids', 'r') as f:
+        with open('./secrets/telegram_ids', 'r') as f:
             self.ids = f.read()
         self.bot = telebot.TeleBot(self.token, threaded=False)
 
