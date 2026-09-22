@@ -21,6 +21,10 @@ MONTHS = [
 MONTHS_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 
 
+def now():
+    return datetime.datetime.now(MSK).replace(tzinfo=None)
+
+
 def today():
     return datetime.datetime.now(MSK).date()
 

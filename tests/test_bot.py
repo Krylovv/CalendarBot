@@ -8,7 +8,16 @@ import httplib2
 from googleapiclient.errors import HttpError
 from support import timed_event
 
-from Bot import ABOUT, COMMANDS, Bot, booking_card, describe_error, format_event, split_message
+from Bot import (
+    ABOUT,
+    COMMANDS,
+    Bot,
+    booking_card,
+    describe_error,
+    format_event,
+    report_text,
+    split_message,
+)
 
 
 class AboutTest(unittest.TestCase):
@@ -105,12 +114,21 @@ class FormattingTest(unittest.TestCase):
             description="@anna\nзвонила",
         )
         self.assertEqual(format_event(manual), "24.09 чт 19:30–21:30\nАнна\n@anna")
+        manual["description"] = "public: yes\n"
+        self.assertEqual(format_event(manual), "24.09 чт 19:30–21:30\nАнна")
         all_day = {
             "summary": "Праздник",
             "start": {"date": "2026-09-27"},
             "end": {"date": "2026-09-28"},
         }
         self.assertEqual(format_event(all_day), "27.09 вс весь день\nПраздник")
+
+    def test_report_text(self):
+        self.assertEqual(
+            report_text(2026, 9, "Сентябрь 2026", (12, 180000, 36000)),
+            "📊 Отчёт за сентябрь 2026 готов — лист «Сентябрь 2026» в таблице заявок\n"
+            "12 аренд · 180 000 ₽ · 20% — 36 000 ₽",
+        )
 
     def test_error_description_has_no_urls(self):
         error = HttpError(

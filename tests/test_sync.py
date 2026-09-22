@@ -1,7 +1,8 @@
+import datetime
 import unittest
 from unittest import mock
 
-from support import use_tariffs
+from support import timed_event, use_tariffs
 
 import Spreadsheet
 from Calendar import EventExists
@@ -15,6 +16,7 @@ def bare_sheet():
     sheet = Spreadsheet.Spreadsheets.__new__(Spreadsheet.Spreadsheets)
     sheet.SPREADSHEET_ID = "test"
     sheet.notifier = mock.Mock()
+    sheet.report_done = sheet.report_alerted = None
     return sheet
 
 
@@ -107,6 +109,7 @@ class HealthAlertTest(unittest.TestCase):
                 raise Stop
 
         sheet.sync_once = sync_once
+        sheet.report_tick = lambda: None
         with (
             mock.patch.object(Spreadsheet, "sleep", sleep),
             mock.patch.object(Spreadsheet.traceback, "print_exc"),
@@ -116,6 +119,75 @@ class HealthAlertTest(unittest.TestCase):
         calls = [call[0] for call in sheet.notifier.method_calls]
         # One alert at the 3rd failed pass, one recovery; the later single blip stays quiet
         self.assertEqual(calls, ["sync_failed", "sync_recovered"])
+
+
+LAST_DAY = datetime.datetime(2026, 9, 30, 21, 0)
+
+
+class ReportTickTest(unittest.TestCase):
+    def setUp(self):
+        use_tariffs(self)
+        self.sheet = bare_sheet()
+        self.sheet.sheet_ids = mock.Mock(return_value={"Заявки": 0, "Август 2026": 4})
+        self.sheet.batch_update = mock.Mock()
+        self.calendar = mock.Mock()
+        self.calendar.get_events_for_month.return_value = [
+            timed_event(
+                "2026-09-21T19:00:00+03:00",
+                "2026-09-21T21:00:00+03:00",
+                description="public: yes",
+                private={"summ": "9000"},
+            )
+        ]
+        patcher = mock.patch.object(Spreadsheet, "Calendar", return_value=self.calendar)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_creates_sheet_once(self):
+        self.sheet.report_tick(LAST_DAY)
+        self.sheet.report_tick(LAST_DAY + datetime.timedelta(seconds=30))
+        self.sheet.batch_update.assert_called_once()
+        requests = self.sheet.batch_update.call_args.args[0]
+        self.assertEqual(
+            requests[0], {"addSheet": {"properties": {"sheetId": 5, "title": "Сентябрь 2026"}}}
+        )
+        self.calendar.get_events_for_month.assert_called_once_with(2026, 9)
+        self.sheet.notifier.monthly_report.assert_called_once_with(
+            2026, 9, "Сентябрь 2026", (1, 9000, 1800)
+        )
+
+    def test_waits_until_report_hour(self):
+        self.sheet.report_tick(LAST_DAY - datetime.timedelta(minutes=1))
+        self.sheet.sheet_ids.assert_not_called()
+
+    def test_existing_sheet_is_kept(self):
+        self.sheet.sheet_ids.return_value = {"Заявки": 0, "Сентябрь 2026": 5}
+        self.sheet.report_tick(LAST_DAY)
+        self.sheet.batch_update.assert_not_called()
+        self.sheet.notifier.report_exists.assert_called_once_with("Сентябрь 2026")
+
+    def test_existing_sheet_is_quiet_when_catching_up(self):
+        self.sheet.sheet_ids.return_value = {"Заявки": 0, "Сентябрь 2026": 5}
+        self.sheet.report_tick(datetime.datetime(2026, 10, 1, 9, 0))
+        self.sheet.batch_update.assert_not_called()
+        self.assertEqual(self.sheet.notifier.method_calls, [])
+
+    def test_rebuild_replaces_sheet(self):
+        self.sheet.sheet_ids.return_value = {"Заявки": 0, "Сентябрь 2026": 5}
+        title, totals = self.sheet.build_report(2026, 9, replace=True)
+        self.assertEqual((title, totals), ("Сентябрь 2026", (1, 9000, 1800)))
+        requests = self.sheet.batch_update.call_args.args[0]
+        self.assertEqual(requests[0], {"deleteSheet": {"sheetId": 5}})
+        self.assertEqual(requests[1]["addSheet"]["properties"]["sheetId"], 6)
+
+    def test_failure_alerts_once_and_retries(self):
+        self.sheet.batch_update.side_effect = [TimeoutError("down"), TimeoutError("down"), None]
+        with mock.patch.object(Spreadsheet.traceback, "print_exc"):
+            for _ in range(3):
+                self.sheet.report_tick(LAST_DAY)
+        self.assertEqual(self.sheet.batch_update.call_count, 3)
+        calls = [call[0] for call in self.sheet.notifier.method_calls]
+        self.assertEqual(calls, ["report_failed", "monthly_report"])
 
 
 if __name__ == "__main__":

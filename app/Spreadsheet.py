@@ -1,6 +1,8 @@
 import traceback
 from time import sleep
 
+import Dates
+import Report
 from Calendar import Calendar, EventExists
 from GoogleApi import GoogleApi, read_secret
 from googleapiclient.discovery import build
@@ -18,7 +20,11 @@ class Spreadsheets(GoogleApi):
         super().__init__()
         self.SPREADSHEET_ID = read_secret("spreadsheet_id")
         # Receives new_booking / duplicate_booking / row_error / sync_failed / sync_recovered
+        # and monthly_report / report_exists / report_failed
         self.notifier = notifier
+        # Month of the last automatic report handled, and of the last failure alert
+        self.report_done = None
+        self.report_alerted = None
 
     # Функция обращения к гугл таблице и получения списка событий
     def get_applications(self) -> list:
@@ -47,6 +53,62 @@ class Spreadsheets(GoogleApi):
             .execute(num_retries=3)
         )
         return result
+
+    def sheet_ids(self):
+        # {title: sheetId} of every sheet
+        service = build("sheets", "v4", credentials=self.creds)
+        result = (
+            service.spreadsheets()
+            .get(spreadsheetId=self.SPREADSHEET_ID, fields="sheets.properties(sheetId,title)")
+            .execute(num_retries=3)
+        )
+        return {
+            sheet["properties"]["title"]: sheet["properties"]["sheetId"]
+            for sheet in result.get("sheets", [])
+        }
+
+    def batch_update(self, requests):
+        service = build("sheets", "v4", credentials=self.creds)
+        # No retries: a retried request that actually succeeded fails on the sheet it added
+        return (
+            service.spreadsheets()
+            .batchUpdate(spreadsheetId=self.SPREADSHEET_ID, body={"requests": requests})
+            .execute()
+        )
+
+    def build_report(self, year, month, replace=False):
+        # -> (title, totals); totals is None when the sheet exists and replace is False
+        title = Report.sheet_title(year, month)
+        sheets = self.sheet_ids()
+        if title in sheets and not replace:
+            return title, None
+        rows = Report.report_rows(Calendar().get_events_for_month(year, month))
+        requests = [{"deleteSheet": {"sheetId": sheets[title]}}] if title in sheets else []
+        sheet_id = max(sheets.values(), default=0) + 1
+        self.batch_update(requests + Report.sheet_requests(sheet_id, title, rows))
+        return title, Report.totals(rows)
+
+    def report_tick(self, now=None):
+        # Called every pass; makes the monthly report sheet once (see Report.due_month)
+        now = now or Dates.now()
+        due = Report.due_month(now)
+        if due is None or due == self.report_done:
+            return
+        try:
+            title, totals = self.build_report(*due)
+        except Exception as error:
+            # Retried on the next pass, alerted once per month; not counted as a sync failure
+            traceback.print_exc()
+            if due != self.report_alerted:
+                self.report_alerted = due
+                self.notify("report_failed", *due, error)
+            return
+        self.report_done = due
+        if totals is not None:
+            self.notify("monthly_report", *due, title, totals)
+        elif due == (now.year, now.month):
+            # An existing sheet is never overwritten; most likely made earlier by /monthly_report
+            self.notify("report_exists", title)
 
     @staticmethod
     def row_text(application):
@@ -122,4 +184,5 @@ class Spreadsheets(GoogleApi):
                 failures += 1
                 if failures == self.ALERT_AFTER_FAILURES:
                     self.notify("sync_failed", error)
+            self.report_tick()
             sleep(30)
