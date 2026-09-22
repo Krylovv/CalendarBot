@@ -15,8 +15,9 @@ class Parser:
         for line in self.text.split("\n"):
             for item in required:
                 if item + ":" in line:
-                    output = line.split(":")
-                    result_dict[output[0]] = output[1][1:]
+                    # Split on the first colon only, so "time: 19:30" keeps its minutes
+                    key, value = line.split(":", 1)
+                    result_dict[key] = value.strip()
         # Форматирование даты под %Y-%m-%d
         result_dict["date"] = (
             result_dict["date"].split("-")[2]
@@ -25,18 +26,15 @@ class Parser:
             + "-"
             + result_dict["date"].split("-")[0]
         )
-        # Функция подсчета суммы
-        summ = self.get_summ(result_dict)
-        result_dict["summ"] = str(summ)
         # Блок форматирования словаря под datetime формат и проверки времени работы
-        rent_start = datetime.datetime.strptime(
-            result_dict["date"] + " " + result_dict["time"], "%Y-%m-%d %H"
-        )
+        rent_start = self.parse_start(result_dict["date"], result_dict["time"])
         rent_end = rent_start + datetime.timedelta(hours=int(result_dict["hours"]))
+        # Функция подсчета суммы
+        result_dict["summ"] = str(self.get_summ(rent_start, rent_end))
         result_dict["end_date"] = str(rent_end.date())
         result_dict["end_time"] = str(rent_end.time())
         result_dict["comment"] = self.check_working_hours(rent_start, rent_end)
-        result_dict["time"] = result_dict["time"] + ":00:00"
+        result_dict["time"] = rent_start.strftime("%H:%M:%S")
         result_dict["description"] = self.description(result_dict)
         return result_dict
 
@@ -53,12 +51,17 @@ class Parser:
             return "Аренда выходит за рамки рабочего дня"
 
     @staticmethod
-    def get_summ(result_dict):
+    def parse_start(date, time):
+        # Accepts "19", "19:30" or "19:30:00"
+        parts = time.split(":")
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        return datetime.datetime.strptime(date, "%Y-%m-%d").replace(hour=hour, minute=minute)
+
+    @staticmethod
+    def get_summ(rent_start, rent_end):
         tariffication_dict = Tariffs.load()
-        in_date = result_dict["date"]
-        start_time = int(result_dict["time"])
-        hours = int(result_dict["hours"])
-        day = datetime.datetime.strptime(in_date, "%Y-%m-%d").date().weekday()
+        day = rent_start.weekday()
         if day <= 3:
             day = "weekday"
         elif day == 4:
@@ -66,16 +69,14 @@ class Parser:
         else:
             day = "weekend"
         pricing = tariffication_dict[day]
-        hours_counter = 0
-        result_price = 0
-        while hours_counter < hours:
-            if start_time + hours_counter < pricing["splitter"]:
-                result_price += pricing["price"][0]
-                hours_counter += 1
-            else:
-                result_price += pricing["price"][1]
-                hours_counter += 1
-        return result_price
+        price_before, price_after = pricing["price"]
+        # Charge by the minute on each side of the tariff switch hour
+        day_start = datetime.datetime.combine(rent_start.date(), datetime.time())
+        switch = day_start + datetime.timedelta(hours=pricing["splitter"])
+        before = max(min(rent_end, switch) - rent_start, datetime.timedelta())
+        after = (rent_end - rent_start) - before
+        hour = datetime.timedelta(hours=1)
+        return round(before / hour * price_before + after / hour * price_after)
 
     @staticmethod
     def description(result_dict):
