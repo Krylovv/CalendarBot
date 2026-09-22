@@ -1,4 +1,8 @@
-FROM python:alpine
+# Pinned: req.txt pins (e.g. PyYAML 6.0.1) have no prebuilt wheels for newer Pythons on Alpine
+FROM python:3.12-alpine
+
+# Show print() output in `docker logs` immediately
+ENV PYTHONUNBUFFERED=1
 
 WORKDIR /opt
 
