@@ -1,5 +1,5 @@
-import json
 import datetime
+import json
 
 import Tariffs
 
@@ -92,17 +92,5 @@ class Parser:
             for key in d:
                 s += key + ": " + str(d[key]) + "\n"
             return s
-        except Exception:
-            return
-
-    @staticmethod
-    def get_monthly_rent_income(descriptions):
-        summ = 0
-        try:
-            for description in descriptions:
-                for line in description.split("\n"):
-                    if "summ" in line:
-                        summ += int(line.split(":")[1][1:])
-            return summ
         except Exception:
             return

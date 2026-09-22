@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# `import support` must run first: it puts app/ on sys.path for the imports after it
+"tests/*" = ["I001"]
+
+[tool.ruff.format]
+quote-style = "double"

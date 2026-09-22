@@ -1,6 +1,11 @@
 from google.oauth2 import service_account
 
 
+def read_secret(name):
+    with open("./secrets/" + name) as secret:
+        return secret.read().strip()
+
+
 class GoogleApi:
     SCOPES = [
         "https://www.googleapis.com/auth/calendar",
