@@ -18,8 +18,17 @@ def is_bot_event(event):
     )
 
 
+# The marker the bot appends to new events; any letter case, with or without brackets.
+# Listing and confirming both use it, so a listed booking can always be confirmed.
+UNTREATED_MARK = re.compile(r"\s*\(?не обработана\)?", re.IGNORECASE)
+
+
 def is_untreated(event):
-    return "не обработана" in (event.get("summary") or "").lower()
+    return bool(UNTREATED_MARK.search(event.get("summary") or ""))
+
+
+def strip_untreated(summary):
+    return UNTREATED_MARK.sub("", summary).strip()
 
 
 def title(event):

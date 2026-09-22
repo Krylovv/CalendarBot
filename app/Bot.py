@@ -7,7 +7,7 @@ import Dates
 import Income
 import Tariffs
 import telebot
-from Calendar import UNTREATED, Calendar, EventExists
+from Calendar import Calendar, EventExists
 from googleapiclient.errors import HttpError
 from Parser import Parser
 from telebot import types
@@ -32,7 +32,7 @@ ABOUT = """Что умеет бот
 
 📋 Команды
 /next_week_rents — аренды на следующую неделю (пн–вс)
-/untreated_rents — необработанные аренды на ближайшие полгода
+/untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить и ❌ Отменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
 /monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы. Кнопками ✏️ можно записать точную сумму или отметить, что это не аренда
 /tariffs — посмотреть и изменить тарифы
 /about — эта справка
@@ -49,7 +49,11 @@ ABOUT = """Что умеет бот
 
 💰 Как считается сумма
 Тариф зависит от дня: будни (пн–чт), пятница или выходные. У каждого есть цена за час до и после часа смены тарифа. Время считается по минутам: аренда 17:30–19:30 при смене в 18:00 — это 30 минут по первой цене и полтора часа по второй."""
+
 MESSAGE_LIMIT = 4096
+# One card per booking in /untreated_rents; more than ~10 messages at once risks
+# Telegram's flood limit (429), so the rest come on the next request
+UNTREATED_CARDS = 10
 CALLBACK_LIMIT = 64
 
 
@@ -125,7 +129,7 @@ def format_event(event):
 
 def booking_card(event, conflicts=()):
     fields = description_fields(event)
-    name = Income.title(event).replace(UNTREATED, "")
+    name = Income.strip_untreated(Income.title(event))
     people = fields.get("people") and fields["people"] + " чел."
     lines = [" · ".join(filter(None, [name, fields.get("tg"), people]))]
     bounds = Dates.event_bounds(event)
@@ -389,10 +393,22 @@ class Bot:
                 if not events:
                     self.bot.reply_to(message, "Необработанных аренд нет")
                     return
-                body = "\n\n".join(format_event(event) for event in events)
-                self.send_long(
-                    message.chat.id, f"Необработанные аренды ({len(events)}):\n\n" + body
-                )
+                shown = events[:UNTREATED_CARDS]
+                header = f"Необработанные аренды: {len(events)}"
+                if len(events) > len(shown):
+                    header += (
+                        f"\nПоказаны ближайшие {len(shown)}. "
+                        "Подтвердите или отмените их и запросите список снова"
+                    )
+                self.bot.send_message(message.chat.id, header)
+                # The same cards as new-booking notifications, so every pending booking
+                # can be confirmed or cancelled from here even if its notification was lost
+                for event in shown:
+                    self.bot.send_message(
+                        message.chat.id,
+                        booking_card(event),
+                        reply_markup=self.booking_markup(event),
+                    )
             except Exception:
                 traceback.print_exc()
                 self.bot.reply_to(message, FAILED)

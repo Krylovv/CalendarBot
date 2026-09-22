@@ -26,6 +26,17 @@ class RecordedSummTest(unittest.TestCase):
         self.assertFalse(Income.is_bot_event(event))
 
 
+class UntreatedMarkTest(unittest.TestCase):
+    def test_any_spelling_is_listed_and_confirmable(self):
+        for summary in ("Иван (не обработана)", "Иван (Не обработана)", "Иван не обработана"):
+            self.assertTrue(Income.is_untreated({"summary": summary}), summary)
+            self.assertEqual(Income.strip_untreated(summary), "Иван")
+
+    def test_confirmed_titles(self):
+        self.assertFalse(Income.is_untreated({"summary": "Иван"}))
+        self.assertFalse(Income.is_untreated({}))
+
+
 class MonthTest(unittest.TestCase):
     def setUp(self):
         use_tariffs(self)

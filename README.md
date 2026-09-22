@@ -18,7 +18,7 @@ A Telegram bot (Russian UI) for a rental venue. It turns booking requests from a
 | Command | What it does |
 |---|---|
 | `/next_week_rents` | Events for next week, Monday–Sunday |
-| `/untreated_rents` | Unconfirmed bookings for the next 180 days |
+| `/untreated_rents` | Unconfirmed bookings for the next 180 days, each as a card with ✅/❌ buttons, so a lost notification never loses a booking (up to 10 cards per request) |
 | `/monthly_income` | Pick a month, get income. Events with a recorded sum are counted exactly; events without one (e.g. created by hand) are priced from the tariffs and listed with ✏️ buttons to record the real sum, or `0` for "not a rental". |
 | `/tariffs` | View and edit prices from Telegram |
 | `/about` | Help text describing all of the above |

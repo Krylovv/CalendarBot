@@ -2,6 +2,7 @@ import datetime
 import hashlib
 
 import Dates
+import Income
 from GoogleApi import GoogleApi, read_secret
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -113,10 +114,9 @@ class Calendar(GoogleApi):
     def confirm_event(self, event_id):
         # Returns (event, changed); confirming twice is harmless
         event = self.get_event(event_id)
-        summary = event.get("summary") or ""
-        if UNTREATED not in summary:
+        if not Income.is_untreated(event):
             return event, False
-        body = {"summary": summary.replace(UNTREATED, "")}
+        body = {"summary": Income.strip_untreated(event["summary"])}
         event = (
             self.service()
             .events()
@@ -146,9 +146,7 @@ class Calendar(GoogleApi):
     def get_untreated_rents(self):
         start = Dates.start_of(Dates.today())
         events = self.list_events(start, start + datetime.timedelta(days=180))
-        return [
-            event for event in events if "не обработана" in (event.get("summary") or "").lower()
-        ]
+        return [event for event in events if Income.is_untreated(event)]
 
     def get_events_for_month(self, year, month):
         # Full month in Moscow time; an event belongs to the month it starts in
