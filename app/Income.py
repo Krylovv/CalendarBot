@@ -31,6 +31,30 @@ def strip_untreated(summary):
     return UNTREATED_MARK.sub("", summary).strip()
 
 
+# Added to a booking's description once its public copy exists; the monthly report takes only
+# tagged events. Staff may type it by hand for bookings published manually. The web editor
+# may store the description as HTML, so the line is matched anywhere, &nbsp; included.
+PUBLIC_TAG = "public: yes"
+PUBLIC_MARK = re.compile(r"\bpublic:(?:\s|&nbsp;)*yes\b", re.IGNORECASE)
+
+
+def is_published(event):
+    return bool(PUBLIC_MARK.search(event.get("description") or ""))
+
+
+def add_public_tag(description):
+    description = description or ""
+    if PUBLIC_MARK.search(description):
+        return description
+    if description and not description.endswith("\n"):
+        description += "\n"
+    return description + PUBLIC_TAG + "\n"
+
+
+def strip_public_tag(description):
+    return PUBLIC_MARK.sub("", description or "").strip()
+
+
 def title(event):
     return event.get("summary") or "Без названия"
 

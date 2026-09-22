@@ -5,11 +5,13 @@ import traceback
 
 import Dates
 import Income
+import Report
 import Tariffs
 import telebot
 from Calendar import Calendar, EventExists
 from googleapiclient.errors import HttpError
 from Parser import Parser
+from Spreadsheet import Spreadsheets
 from telebot import types
 
 DENIED = (
@@ -24,6 +26,7 @@ COMMANDS = [
     ("next_week_rents", "Посмотреть аренды на следующую неделю"),
     ("untreated_rents", "Посмотреть необработанные аренды"),
     ("monthly_income", "Доход за месяц"),
+    ("monthly_report", "Собрать отчёт за месяц в таблицу"),
     ("tariffs", "Посмотреть и изменить тарифы"),
     ("about", "Что умеет бот"),
 ]
@@ -34,12 +37,14 @@ ABOUT = """Что умеет бот
 /next_week_rents — аренды на следующую неделю (пн–вс)
 /untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить и ❌ Отменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
 /monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы. Кнопками ✏️ можно записать точную сумму или отметить, что это не аренда
+/monthly_report — прямо сейчас собрать отчёт за текущий месяц (с 1-го числа) на новом листе таблицы заявок. Если лист уже есть, бот предложит собрать его заново
 /tariffs — посмотреть и изменить тарифы
 /about — эта справка
 
 🔄 Автоматически
 • Каждые 30 секунд бот проверяет таблицу заявок. Новая заявка становится событием «(не обработана)» в календаре, а в колонке P появляется TRUE.
-• О каждой новой аренде бот пишет сюда: время, сумма, пересечения с другими событиями и выход за рабочие часы (10:00–23:00). Кнопки: ✅ Подтвердить — убирает «(не обработана)», ❌ Отменить — удаляет событие из календаря.
+• О каждой новой аренде бот пишет сюда: время, сумма, пересечения с другими событиями и выход за рабочие часы (10:00–23:00). Кнопки: ✅ Подтвердить — копирует аренду в публичный календарь (только имя и время, без описания), убирает «(не обработана)» и дописывает в описание строку «public: yes»; ❌ Отменить — удаляет событие из обоих календарей.
+• В последний день месяца в 21:00 бот создаёт в таблице заявок лист «Месяц год» (имя, дата, сумма, комментарий, 20%, итог). В него попадают подтверждённые аренды (со строкой «public: yes» в описании) и события, созданные вручную: для них сумма по тарифам и комментарий «Не автоматизированная аренда». Готовый лист бот не перезаписывает.
 • Если строку не удалось разобрать, в колонке P появится «ОШИБКА: …» и придёт сообщение. Исправьте строку и очистите ячейку — бот попробует снова.
 • Повторная заявка на ту же аренду не создаёт второе событие.
 • Если связь с Google пропала дольше чем на полторы минуты, бот предупредит и сообщит, когда всё восстановится.
@@ -114,7 +119,7 @@ def format_event(event):
         if fields.get("people"):
             details.append(fields["people"] + " чел.")
     else:
-        description = (event.get("description") or "").strip()
+        description = Income.strip_public_tag(event.get("description"))
         if description:
             details.append(description.splitlines()[0][:100])
     summ = Income.recorded_summ(event)
@@ -125,6 +130,15 @@ def format_event(event):
     if Income.is_bot_event(event) and fields.get("comment"):
         lines.append("⚠️ " + fields["comment"])
     return "\n".join(lines)
+
+
+def report_text(year, month, title, totals):
+    count, total, share = totals
+    return (
+        f"📊 Отчёт за {Dates.MONTHS[month - 1]} {year} готов — лист «{title}» в таблице заявок\n"
+        f"{Income.rents(count)} · {Income.money(total)} ₽ · "
+        f"{Report.SHARE_PERCENT}% — {Income.money(share)} ₽"
+    )
 
 
 def booking_card(event, conflicts=()):
@@ -233,6 +247,24 @@ class Bot:
                 markup.add(button(label, self.event_callback("inc:s", event["id"])))
         self.send_long(chat_id, Income.format_report(year, month, recorded, estimated), markup)
 
+    def send_report(self, chat_id, year, month, replace=False):
+        title, totals = Spreadsheets().build_report(year, month, replace)
+        if totals is None:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(button("🔄 Собрать заново", f"rep:{year}-{month:02d}"))
+            self.bot.send_message(
+                chat_id,
+                f"Лист «{title}» уже есть. Собрать заново? Правки на листе пропадут",
+                reply_markup=markup,
+            )
+            return
+        self.bot.send_message(
+            chat_id,
+            report_text(year, month, title, totals)
+            + "\n\nАвтоматический отчёт в конце месяца этот лист не перезапишет: "
+            "если он тестовый, удалите его или соберите заново командой /monthly_report",
+        )
+
     # --- notifications from the sync loop (see Spreadsheets.notify)
 
     def notify_admins(self, text, reply_markup=None):
@@ -283,6 +315,21 @@ class Bot:
     def sync_recovered(self):
         self.notify_admins("✅ Синхронизация таблицы с календарём восстановлена")
 
+    def monthly_report(self, year, month, title, totals):
+        self.notify_admins(report_text(year, month, title, totals))
+
+    def report_exists(self, title):
+        self.notify_admins(
+            f"📊 Лист «{title}» уже есть, автоматический отчёт его не перезаписал. "
+            "Собрать заново: /monthly_report"
+        )
+
+    def report_failed(self, year, month, error):
+        self.notify_admins(
+            f"⚠️ Не удалось создать отчёт за {Dates.MONTHS[month - 1]} {year}: "
+            f"{describe_error(error)}\nБот повторяет попытки каждые 30 секунд."
+        )
+
     # --- booking buttons
 
     def append_status(self, call, note, reply_markup=None):
@@ -330,7 +377,11 @@ class Bot:
                     chat_id, message_id, reply_markup=self.booking_markup(event)
                 )
                 return "Уже подтверждено"
-            self.append_status(call, f"✅ Подтверждено ({who})", self.booking_markup(event))
+            self.append_status(
+                call,
+                f"✅ Подтверждено, добавлено в публичный календарь ({who})",
+                self.booking_markup(event),
+            )
             return "Подтверждено"
         if action == "keep":
             self.bot.edit_message_reply_markup(
@@ -496,6 +547,33 @@ class Bot:
             except Exception:
                 traceback.print_exc()
                 self.bot.reply_to(message, FAILED)
+
+        @self.bot.message_handler(commands=["monthly_report"])
+        def monthly_report(message):
+            if not self.allowed(message.from_user):
+                self.bot.reply_to(message, DENIED)
+                return
+            today = Dates.today()
+            try:
+                self.send_report(message.chat.id, today.year, today.month)
+            except Exception:
+                traceback.print_exc()
+                self.bot.reply_to(message, FAILED)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith("rep:"))
+        def rebuild_report(call):
+            self.answer(call)
+            if not self.allowed(call.from_user):
+                return
+            chat_id = call.message.chat.id
+            try:
+                year, month = map(int, call.data.split(":", 1)[1].split("-"))
+                # Drop the button first, so a double tap can't rebuild the sheet twice
+                self.bot.edit_message_reply_markup(chat_id, call.message.message_id)
+                self.send_report(chat_id, year, month, replace=True)
+            except Exception:
+                traceback.print_exc()
+                self.bot.send_message(chat_id, FAILED)
 
         @self.bot.callback_query_handler(func=lambda call: call.data.startswith("bk:"))
         def booking_action(call):

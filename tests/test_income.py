@@ -37,6 +37,21 @@ class UntreatedMarkTest(unittest.TestCase):
         self.assertFalse(Income.is_untreated({}))
 
 
+class PublicTagTest(unittest.TestCase):
+    def test_tag_is_added_once(self):
+        tagged = Income.add_public_tag("type: automated\ntg: @ivan")
+        self.assertEqual(tagged, "type: automated\ntg: @ivan\npublic: yes\n")
+        self.assertEqual(Income.add_public_tag(tagged), tagged)
+        self.assertEqual(Income.add_public_tag(None), "public: yes\n")
+
+    def test_tag_typed_by_hand(self):
+        for description in ("Public: Yes", "@anna<br>public:&nbsp;yes", "звонила\npublic:yes"):
+            self.assertTrue(Income.is_published({"description": description}), description)
+        for description in ("", "public: no", "republic: yes"):
+            self.assertFalse(Income.is_published({"description": description}), description)
+        self.assertFalse(Income.is_published({}))
+
+
 class MonthTest(unittest.TestCase):
     def setUp(self):
         use_tariffs(self)

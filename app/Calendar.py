@@ -28,6 +28,10 @@ class Calendar(GoogleApi):
     def service(self):
         return build("calendar", "v3", credentials=self.creds)
 
+    def public_calendar_id(self):
+        # Read on use, so a missing file breaks only confirming and cancelling, not every command
+        return read_secret("public_calendar_id")
+
     def list_events(self, start, end):
         # All events overlapping [start, end), following pagination
         service = self.service()
@@ -58,6 +62,39 @@ class Calendar(GoogleApi):
         fields = ("name", "tg", "date", "time", "hours", "people")
         key = "|".join(str(result_dict.get(field, "")) for field in fields)
         return "cb" + hashlib.sha1(key.encode()).hexdigest()
+
+    @staticmethod
+    def public_event_id(event_id):
+        # The public copy is found from its booking, so confirming twice can't duplicate it.
+        # Not the booking's own ID: Google may merge events sharing an iCalUID.
+        return "cbp" + hashlib.sha1(event_id.encode()).hexdigest()
+
+    @staticmethod
+    def public_body(event):
+        # Name and time only: the public calendar must not show personal details
+        return {
+            "id": Calendar.public_event_id(event["id"]),
+            "summary": Income.strip_untreated(Income.title(event)),
+            "start": event["start"],
+            "end": event["end"],
+        }
+
+    def publish_event(self, event):
+        body = self.public_body(event)
+        calendar_id = self.public_calendar_id()
+        events = self.service().events()
+        try:
+            # No retries, as in create_event
+            return events.insert(calendarId=calendar_id, body=body).execute()
+        except HttpError as error:
+            if error.resp.status != 409:
+                raise
+        # Published before (or deleted by hand, which keeps the ID taken): bring it back as is now
+        update = {key: value for key, value in body.items() if key != "id"}
+        update["status"] = "confirmed"
+        return events.patch(calendarId=calendar_id, eventId=body["id"], body=update).execute(
+            num_retries=3
+        )
 
     def find_overlaps(self, start, end):
         # The API already returns only events overlapping [start, end); skip all-day markers
@@ -116,7 +153,12 @@ class Calendar(GoogleApi):
         event = self.get_event(event_id)
         if not Income.is_untreated(event):
             return event, False
-        body = {"summary": Income.strip_untreated(event["summary"])}
+        # Publish first: if that fails, the booking stays untreated and can be confirmed again
+        self.publish_event(event)
+        body = {
+            "summary": Income.strip_untreated(event["summary"]),
+            "description": Income.add_public_tag(event.get("description")),
+        }
         event = (
             self.service()
             .events()
@@ -126,9 +168,17 @@ class Calendar(GoogleApi):
         return event, True
 
     def delete_event(self, event_id):
-        self.service().events().delete(calendarId=self.CALENDAR_ID, eventId=event_id).execute(
-            num_retries=3
-        )
+        # The public copy first: if deleting the booking then fails, a retry finishes the job
+        events = self.service().events()
+        try:
+            events.delete(
+                calendarId=self.public_calendar_id(), eventId=self.public_event_id(event_id)
+            ).execute(num_retries=3)
+        except HttpError as error:
+            # Unconfirmed bookings have no public copy
+            if error.resp.status not in (404, 410):
+                raise
+        events.delete(calendarId=self.CALENDAR_ID, eventId=event_id).execute(num_retries=3)
 
     def set_event_summ(self, event_id, summ):
         body = {"extendedProperties": {"private": {"summ": str(summ)}}}
