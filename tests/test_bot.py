@@ -1,12 +1,15 @@
+import datetime
+import itertools
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import httplib2
 from googleapiclient.errors import HttpError
-from support import timed_event
+from support import timed_event, use_tariffs
 
 from Bot import (
     ABOUT,
@@ -15,6 +18,7 @@ from Bot import (
     booking_card,
     describe_error,
     format_event,
+    move_preview,
     report_text,
     split_message,
 )
@@ -137,6 +141,67 @@ class FormattingTest(unittest.TestCase):
             uri="https://sheets.googleapis.com/v4/spreadsheets/SECRET_ID/values",
         )
         self.assertEqual(describe_error(error), "HTTP 404: Not Found")
+
+
+def bot_booking(summ="18000"):
+    # Wed 19:30-23:30 by the test tariffs: 4 * 4500 = 18000
+    return timed_event(
+        "2026-09-23T19:30:00+03:00",
+        "2026-09-23T23:30:00+03:00",
+        summary="Иван",
+        description="type: automated\ntg: @ivan\npeople: 5\nsumm: 18000\ncomment: \npublic: yes\n",
+        private={"source": "calendarbot", "summ": summ},
+        event_id="cb1",
+    )
+
+
+class MoveTest(unittest.TestCase):
+    START, END = datetime.datetime(2026, 10, 3, 21), datetime.datetime(2026, 10, 3, 23, 30)
+
+    def setUp(self):
+        use_tariffs(self)
+        now = mock.patch("Dates.now", return_value=datetime.datetime(2026, 9, 27, 12))
+        now.start()
+        self.addCleanup(now.stop)
+
+    def test_preview_with_tariff_sum(self):
+        other = timed_event(
+            "2026-10-03T22:00:00+03:00", "2026-10-04T00:00:00+03:00", summary="Пётр"
+        )
+        self.assertEqual(
+            move_preview(bot_booking(), self.START, self.END, [other]).splitlines(),
+            [
+                "📅 Перенести аренду?",
+                "Иван · @ivan · 5 чел.",
+                "Было: 23.09 ср 19:30–23:30 (4 ч)",
+                "Станет: 03.10 сб 21:00–23:30 (2,5 ч)",
+                "Сумма по тарифу: 18 000 → 12 500 ₽",
+                "⚠️ Пересекается: 03.10 сб 22:00–00:00 Пётр",
+                "⚠️ Аренда выходит за рамки рабочего дня",
+                "Публичная копия тоже будет перенесена",
+            ],
+        )
+
+    def test_preview_keeps_discount(self):
+        lines = move_preview(bot_booking(summ="15000"), self.START, self.END, []).splitlines()
+        self.assertIn("Сумма: 15 000 ₽", lines)
+        self.assertIn("Сумма изменена вручную и не пересчитается (по тарифу 12 500 ₽)", lines)
+
+    def test_move_button_works_once(self):
+        bot = Bot.__new__(Bot)
+        bot.callback_ids, bot.moves, bot.move_tokens = {}, {}, itertools.count()
+        bot.bot = mock.Mock()
+        bot.moves["0"] = ("cb1", self.START, self.END, None)
+        call = SimpleNamespace(
+            data="mv:ok:0",
+            message=SimpleNamespace(chat=SimpleNamespace(id=1), message_id=2, text="превью"),
+            from_user=SimpleNamespace(first_name="Аня"),
+        )
+        with mock.patch("Bot.Calendar") as calendar:
+            calendar.return_value.move_event.return_value = (bot_booking(), [])
+            self.assertEqual(bot.handle_move_action(call), "Перенесено")
+            self.assertEqual(bot.handle_move_action(call), "Кнопка устарела")
+        calendar.return_value.move_event.assert_called_once_with("cb1", self.START, self.END)
 
 
 if __name__ == "__main__":

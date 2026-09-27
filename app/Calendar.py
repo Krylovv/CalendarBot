@@ -10,6 +10,7 @@ from Parser import Parser
 
 UNTREATED = " (не обработана)"
 SOURCE = "calendarbot"
+OVERLAP_NOTE = "Аренда пересекается с другими событиями"
 
 
 class EventExists(Exception):
@@ -96,6 +97,10 @@ class Calendar(GoogleApi):
             num_retries=3
         )
 
+    @staticmethod
+    def time_field(value):
+        return {"dateTime": Dates.rfc3339(value), "timeZone": "Europe/Moscow"}
+
     def find_overlaps(self, start, end):
         # The API already returns only events overlapping [start, end); skip all-day markers
         return [event for event in self.list_events(start, end) if Dates.event_bounds(event)]
@@ -107,7 +112,7 @@ class Calendar(GoogleApi):
         )
         conflicts = self.find_overlaps(start, end)
         if conflicts:
-            note = "Аренда пересекается с другими событиями"
+            note = OVERLAP_NOTE
             result_dict["comment"] = ", ".join(filter(None, [result_dict["comment"], note]))
             result_dict["description"] = Parser.description(result_dict)
         private = {"source": SOURCE, "summ": result_dict["summ"]}
@@ -117,8 +122,8 @@ class Calendar(GoogleApi):
             "id": self.event_id(result_dict),
             "summary": result_dict.get("name", "") + UNTREATED,
             "description": result_dict["description"],
-            "start": {"dateTime": Dates.rfc3339(start), "timeZone": "Europe/Moscow"},
-            "end": {"dateTime": Dates.rfc3339(end), "timeZone": "Europe/Moscow"},
+            "start": self.time_field(start),
+            "end": self.time_field(end),
             "extendedProperties": {"private": private},
         }
         try:
@@ -179,6 +184,45 @@ class Calendar(GoogleApi):
             if error.resp.status not in (404, 410):
                 raise
         events.delete(calendarId=self.CALENDAR_ID, eventId=event_id).execute(num_retries=3)
+
+    def find_conflicts(self, event_id, start, end):
+        # Overlaps at a new time, without the booking itself
+        return [event for event in self.find_overlaps(start, end) if event["id"] != event_id]
+
+    def move_event(self, event_id, start, end):
+        # -> (event, conflicts); moving to the same time again is harmless
+        event = self.get_event(event_id)
+        conflicts = self.find_conflicts(event_id, start, end)
+        body = {"start": self.time_field(start), "end": self.time_field(end)}
+        summ = Income.summ_after_move(event, start, end)
+        if summ is not None and summ != Income.recorded_summ(event):
+            body["extendedProperties"] = {"private": {"summ": str(summ)}}
+        if Income.is_bot_event(event):
+            # Warnings on the card must describe the new time, not the old one
+            notes = [Parser.check_working_hours(start, end), conflicts and OVERLAP_NOTE]
+            description = Income.set_description_field(
+                event.get("description"), "comment", ", ".join(filter(None, notes))
+            )
+            if summ is not None:
+                description = Income.set_description_field(description, "summ", summ)
+            body["description"] = description
+        events = self.service().events()
+        if Income.is_published(event):
+            # The public copy first, as in delete_event: a retry finishes the job
+            try:
+                events.patch(
+                    calendarId=self.public_calendar_id(),
+                    eventId=self.public_event_id(event_id),
+                    body={"start": body["start"], "end": body["end"]},
+                ).execute(num_retries=3)
+            except HttpError as error:
+                # Tagged by hand, without a copy made by the bot
+                if error.resp.status not in (404, 410):
+                    raise
+        event = events.patch(calendarId=self.CALENDAR_ID, eventId=event_id, body=body).execute(
+            num_retries=3
+        )
+        return event, conflicts
 
     def set_event_summ(self, event_id, summ):
         body = {"extendedProperties": {"private": {"summ": str(summ)}}}

@@ -1,10 +1,11 @@
+import datetime
 import re
 import unittest
 from unittest import mock
 
 import httplib2
 from googleapiclient.errors import HttpError
-from support import timed_event
+from support import timed_event, use_tariffs
 
 from Calendar import Calendar
 
@@ -47,7 +48,7 @@ class PublicCopyTest(unittest.TestCase):
         self.assertRegex(event_id, re.compile(r"^[a-v0-9]{5,1024}$"))
 
 
-class ConfirmDeleteTest(unittest.TestCase):
+class MockedCalendar(unittest.TestCase):
     def setUp(self):
         # Skip GoogleApi.__init__: no credentials, a mock in place of the API
         self.calendar = Calendar.__new__(Calendar)
@@ -60,6 +61,8 @@ class ConfirmDeleteTest(unittest.TestCase):
     def calls(self):
         return [(name, kwargs["calendarId"]) for name, _, kwargs in self.events.method_calls]
 
+
+class ConfirmDeleteTest(MockedCalendar):
     def test_confirm_publishes_then_tags(self):
         self.events.get.return_value.execute.return_value = booking()
         _, changed = self.calendar.confirm_event("cb1")
@@ -114,6 +117,36 @@ class ConfirmDeleteTest(unittest.TestCase):
         with self.assertRaises(HttpError):
             self.calendar.delete_event("cb1")
         self.assertEqual(self.calls(), [("delete", "public")])
+
+
+class MoveTest(MockedCalendar):
+    # 23.09 Wed 19:30-23:30 (4 * 4500) -> 26.09 Sat 14:00-18:00 (2 * 4500 + 2 * 5000)
+    NEW = datetime.datetime(2026, 9, 26, 14), datetime.datetime(2026, 9, 26, 18)
+
+    def setUp(self):
+        super().setUp()
+        use_tariffs(self)
+        self.calendar.find_overlaps = lambda start, end: [booking()]
+
+    def test_confirmed_booking_moves_with_public_copy(self):
+        event = booking(summary="Иван")
+        event["description"] += "comment: Аренда пересекается с другими событиями\npublic: yes\n"
+        event["extendedProperties"]["private"]["summ"] = "18000"
+        self.events.get.return_value.execute.return_value = event
+        _, conflicts = self.calendar.move_event("cb1", *self.NEW)
+        self.assertEqual(conflicts, [])
+        self.assertEqual(self.calls(), [("get", "tech"), ("patch", "public"), ("patch", "tech")])
+        public, main = (call.kwargs for call in self.events.patch.call_args_list)
+        self.assertEqual(public["eventId"], Calendar.public_event_id("cb1"))
+        self.assertEqual(public["body"]["start"]["dateTime"], "2026-09-26T14:00:00+03:00")
+        self.assertEqual(main["body"]["extendedProperties"], {"private": {"summ": "19000"}})
+        self.assertIn("summ: 19000\ncomment: \npublic: yes\n", main["body"]["description"])
+
+    def test_discount_is_kept(self):
+        self.events.get.return_value.execute.return_value = booking()
+        self.calendar.move_event("cb1", *self.NEW)
+        self.assertEqual(self.calls(), [("get", "tech"), ("patch", "tech")])
+        self.assertNotIn("extendedProperties", self.events.patch.call_args.kwargs["body"])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import itertools
 import time
 import traceback
 
@@ -8,7 +9,7 @@ import Income
 import Report
 import Tariffs
 import telebot
-from Calendar import Calendar, EventExists
+from Calendar import OVERLAP_NOTE, Calendar, EventExists
 from googleapiclient.errors import HttpError
 from Parser import Parser
 from Spreadsheet import Spreadsheets
@@ -19,12 +20,12 @@ DENIED = (
     + "Пожалуйста, напишите своего и пользуйтесь"
 )
 FAILED = "Тут какая-то ошибка"
-OVERLAP_NOTE = "Аренда пересекается с другими событиями"
 
 # Telegram command menu; /about must describe every entry (checked in tests/test_bot.py)
 COMMANDS = [
     ("next_week_rents", "Посмотреть аренды на следующую неделю"),
     ("untreated_rents", "Посмотреть необработанные аренды"),
+    ("find_rent", "Найти аренду по дате, чтобы изменить или отменить"),
     ("monthly_income", "Доход за месяц"),
     ("monthly_report", "Собрать отчёт за месяц в таблицу"),
     ("tariffs", "Посмотреть и изменить тарифы"),
@@ -35,7 +36,8 @@ ABOUT = """Что умеет бот
 
 📋 Команды
 /next_week_rents — аренды на следующую неделю (пн–вс)
-/untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить и ❌ Отменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
+/untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить, ❌ Отменить и ✏️ Изменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
+/find_rent — аренды за указанный день с теми же кнопками, в том числе подтверждённые
 /monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы. Кнопками ✏️ можно записать точную сумму или отметить, что это не аренда
 /monthly_report — прямо сейчас собрать отчёт за текущий месяц (с 1-го числа) на новом листе таблицы заявок. Если лист уже есть, бот предложит собрать его заново
 /tariffs — посмотреть и изменить тарифы
@@ -43,7 +45,8 @@ ABOUT = """Что умеет бот
 
 🔄 Автоматически
 • Каждые 30 секунд бот проверяет таблицу заявок. Новая заявка становится событием «(не обработана)» в календаре, а в колонке P появляется TRUE.
-• О каждой новой аренде бот пишет сюда: время, сумма, пересечения с другими событиями и выход за рабочие часы (10:00–23:00). Кнопки: ✅ Подтвердить — копирует аренду в публичный календарь (только имя и время, без описания), убирает «(не обработана)» и дописывает в описание строку «public: yes»; ❌ Отменить — удаляет событие из обоих календарей.
+• О каждой новой аренде бот пишет сюда: время, сумма, пересечения с другими событиями и выход за рабочие часы (10:00–23:00). Кнопки: ✅ Подтвердить — копирует аренду в публичный календарь (только имя и время, без описания), убирает «(не обработана)» и дописывает в описание строку «public: yes»; ❌ Отменить — удаляет событие из обоих календарей; ✏️ Изменить — перенести на другую дату и время или поменять стоимость (например, для скидки).
+• При переносе бот показывает новое время, пересечения и сумму и ждёт подтверждения. Публичная копия переносится тоже. Сумма по тарифу пересчитывается, а изменённая вручную остаётся прежней. Строка в таблице заявок не меняется.
 • В последний день месяца в 21:00 бот создаёт в таблице заявок лист «Месяц год» (имя, дата, сумма, комментарий, 20%, итог). В него попадают подтверждённые аренды (со строкой «public: yes» в описании) и события, созданные вручную: для них сумма по тарифам и комментарий «Не автоматизированная аренда». Готовый лист бот не перезаписывает.
 • Если строку не удалось разобрать, в колонке P появится «ОШИБКА: …» и придёт сообщение. Исправьте строку и очистите ячейку — бот попробует снова.
 • Повторная заявка на ту же аренду не создаёт второе событие.
@@ -132,6 +135,38 @@ def format_event(event):
     return "\n".join(lines)
 
 
+def move_preview(event, start, end, conflicts):
+    fields = description_fields(event)
+    name = Income.strip_untreated(Income.title(event))
+    people = fields.get("people") and fields["people"] + " чел."
+    lines = ["📅 Перенести аренду?", " · ".join(filter(None, [name, fields.get("tg"), people]))]
+    bounds = Dates.event_bounds(event)
+    lines.append(f"Было: {Dates.format_span(*bounds)} ({Dates.format_hours(*bounds)})")
+    lines.append(f"Станет: {Dates.format_span(start, end)} ({Dates.format_hours(start, end)})")
+    summ, new_summ = Income.recorded_summ(event), Income.summ_after_move(event, start, end)
+    if summ is not None and new_summ != summ:
+        lines.append(f"Сумма по тарифу: {Income.money(summ)} → {Income.money(new_summ)} ₽")
+    elif summ is not None:
+        lines.append(f"Сумма: {Income.money(summ)} ₽")
+        estimate = Parser.get_summ(start, end)
+        if estimate != summ:
+            lines.append(
+                f"Сумма изменена вручную и не пересчитается (по тарифу {Income.money(estimate)} ₽)"
+            )
+    for other in conflicts:
+        lines.append(
+            f"⚠️ Пересекается: {Dates.format_span(*Dates.event_bounds(other))} {Income.title(other)}"
+        )
+    note = Parser.check_working_hours(start, end)
+    if note:
+        lines.append("⚠️ " + note)
+    if start < Dates.now():
+        lines.append("⚠️ Это время уже прошло")
+    if Income.is_published(event):
+        lines.append("Публичная копия тоже будет перенесена")
+    return "\n".join(lines)
+
+
 def report_text(year, month, title, totals):
     count, total, share = totals
     return (
@@ -173,6 +208,9 @@ class Bot:
         self.bot = telebot.TeleBot(self.token, threaded=False)
         # Short tokens for event IDs too long for Telegram's 64-byte callback data
         self.callback_ids = {}
+        # Moves waiting for confirmation: token -> (event_id, start, end, booking card message)
+        self.moves = {}
+        self.move_tokens = itertools.count()
 
     # --- helpers shared by handlers and sync notifications
 
@@ -216,6 +254,7 @@ class Bot:
             actions.append(button("✅ Подтвердить", self.event_callback("bk:ok", event["id"])))
         actions.append(button("❌ Отменить", self.event_callback("bk:rm", event["id"])))
         markup.row(*actions)
+        markup.add(button("✏️ Изменить", self.event_callback("bk:ed", event["id"])))
         if event.get("htmlLink"):
             markup.add(types.InlineKeyboardButton("Открыть в календаре", url=event["htmlLink"]))
         return markup
@@ -332,9 +371,18 @@ class Bot:
 
     # --- booking buttons
 
-    def append_status(self, call, note, reply_markup=None):
+    def edit_markup(self, event_id):
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            button("📅 Дата и время", self.event_callback("bk:mv", event_id)),
+            button("💰 Стоимость", self.event_callback("bk:pr", event_id)),
+        )
+        markup.add(button("« Назад", self.event_callback("bk:keep", event_id)))
+        return markup
+
+    def append_status(self, message, note, reply_markup=None):
         # Adds an outcome line to the booking card; a repeated tap must not fail on "not modified"
-        text = getattr(call.message, "text", None)
+        text = getattr(message, "text", None)
         if not text:
             # Telegram sends an "inaccessible message" without text for cards the bot can no
             # longer edit; the action itself is done, the toast reports it
@@ -343,7 +391,7 @@ class Bot:
             text += "\n\n" + note
         try:
             self.bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id, reply_markup=reply_markup
+                text, message.chat.id, message.message_id, reply_markup=reply_markup
             )
         except telebot.apihelper.ApiTelegramException as error:
             if "message is not modified" not in str(error):
@@ -365,10 +413,15 @@ class Bot:
             )
             self.bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
             return None
+        if action == "ed":
+            self.bot.edit_message_reply_markup(
+                chat_id, message_id, reply_markup=self.edit_markup(event_id)
+            )
+            return None
         calendar = Calendar()
         event = calendar.find_event(event_id)
         if event is None:
-            self.append_status(call, "Событие уже удалено из календаря")
+            self.append_status(call.message, "Событие уже удалено из календаря")
             return "Событие уже удалено"
         if action == "ok":
             event, changed = calendar.confirm_event(event_id)
@@ -378,7 +431,7 @@ class Bot:
                 )
                 return "Уже подтверждено"
             self.append_status(
-                call,
+                call.message,
                 f"✅ Подтверждено, добавлено в публичный календарь ({who})",
                 self.booking_markup(event),
             )
@@ -390,9 +443,148 @@ class Bot:
             return None
         if action == "rmy":
             calendar.delete_event(event_id)
-            self.append_status(call, f"❌ Отменено, событие удалено ({who})")
+            self.append_status(call.message, f"❌ Отменено, событие удалено ({who})")
             return "Событие удалено"
+        bounds = Dates.event_bounds(event)
+        if not bounds:
+            return "Событие на весь день изменить нельзя"
+        name = Income.strip_untreated(Income.title(event))
+        if action == "mv":
+            self.ask(
+                chat_id,
+                f"📅 Перенос: {name}, {Dates.format_span(*bounds)} ({Dates.format_hours(*bounds)})\n"
+                "Отправьте новую дату и время начала, например «25.10 19:30». "
+                "Длительность останется прежней; чтобы изменить её, добавьте часы: «25.10 19:30 3».\n"
+                "Любая команда — отмена",
+                self.receive_move,
+                event_id,
+                call.message,
+            )
+            return None
+        if action == "pr":
+            summ, estimate = Income.recorded_summ(event), Parser.get_summ(*bounds)
+            now = "не записана" if summ is None else Income.money(summ) + " ₽"
+            self.ask(
+                chat_id,
+                f"💰 Стоимость: {name}, {Dates.format_span(*bounds)}\n"
+                f"Сейчас: {now} · по тарифу: {Income.money(estimate)} ₽\n"
+                "Отправьте новую сумму в рублях, «+» — сумма по тарифу, "
+                "«0» — бесплатно (в доход и отчёт не войдёт). Любая команда — отмена",
+                self.receive_price,
+                event_id,
+                estimate,
+                call.message,
+            )
+            return None
         return None
+
+    # --- editing a booking: replies to the prompts above
+
+    def receive_move(self, message, event_id, card):
+        if not self.allowed(message.from_user):
+            self.bot.reply_to(message, DENIED)
+            return
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            self.bot.reply_to(message, "Перенос отменён")
+            return
+        retry = "Нажмите «📅 Дата и время» ещё раз"
+        try:
+            start, hours = Dates.parse_move(text, Dates.today())
+        except ValueError:
+            self.bot.reply_to(
+                message, f"Не понял дату, нужно «25.10 19:30» или «25.10 19:30 3». {retry}"
+            )
+            return
+        if hours is not None and not 0 < hours <= Income.MAX_RENT_HOURS:
+            self.bot.reply_to(
+                message, f"Длительность — от 0 до {Income.MAX_RENT_HOURS} часов. {retry}"
+            )
+            return
+        try:
+            calendar = Calendar()
+            event = calendar.find_event(event_id)
+            bounds = event and Dates.event_bounds(event)
+            if not bounds:
+                self.bot.reply_to(message, "Событие уже удалено из календаря")
+                return
+            duration = bounds[1] - bounds[0] if hours is None else datetime.timedelta(hours=hours)
+            end = start + duration
+            conflicts = calendar.find_conflicts(event_id, start, end)
+            token = str(next(self.move_tokens))
+            self.moves[token] = (event_id, start, end, card)
+            markup = types.InlineKeyboardMarkup()
+            markup.row(
+                button("✅ Перенести", f"mv:ok:{token}"), button("Не переносить", f"mv:no:{token}")
+            )
+            self.bot.reply_to(
+                message, move_preview(event, start, end, conflicts), reply_markup=markup
+            )
+        except Exception:
+            traceback.print_exc()
+            self.bot.reply_to(message, FAILED)
+
+    def handle_move_action(self, call):
+        _, action, token = call.data.split(":", 2)
+        # Popped first, so a double tap can't move twice
+        move = self.moves.pop(token, None)
+        if move is None:
+            return "Кнопка устарела"
+        chat_id, message_id = call.message.chat.id, call.message.message_id
+        if action == "no":
+            self.append_status(call.message, "Перенос отменён")
+            return None
+        event_id, start, end, card = move
+        calendar = Calendar()
+        if calendar.find_event(event_id) is None:
+            self.bot.edit_message_reply_markup(chat_id, message_id)
+            return "Событие уже удалено"
+        event, conflicts = calendar.move_event(event_id, start, end)
+        who = call.from_user.first_name or "без имени"
+        self.bot.edit_message_text(
+            f"📅 Перенесено ({who})\n" + booking_card(event, conflicts),
+            chat_id,
+            message_id,
+            reply_markup=self.booking_markup(event),
+        )
+        # The old card keeps working, but its time is stale now
+        with contextlib.suppress(Exception):
+            self.append_status(card, f"📅 Перенесено на {Dates.format_span(start, end)} ({who})")
+        return "Перенесено"
+
+    def receive_price(self, message, event_id, estimate, card):
+        if not self.allowed(message.from_user):
+            self.bot.reply_to(message, DENIED)
+            return
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            self.bot.reply_to(message, "Изменение отменено")
+            return
+        try:
+            value = estimate if text == "+" else int(text.replace(" ", ""))
+        except ValueError:
+            value = -1
+        if not 0 <= value <= 10000000:
+            self.bot.reply_to(message, "Некорректная сумма. Нажмите «💰 Стоимость» ещё раз")
+            return
+        try:
+            calendar = Calendar()
+            if calendar.find_event(event_id) is None:
+                self.bot.reply_to(message, "Событие уже удалено из календаря")
+                return
+            event = calendar.set_event_summ(event_id, value)
+            saved = "бесплатно" if value == 0 else Income.money(value) + " ₽"
+            who = message.from_user.first_name or "без имени"
+            self.bot.reply_to(
+                message,
+                f"💰 Стоимость изменена: {saved} ({who})\n" + booking_card(event),
+                reply_markup=self.booking_markup(event),
+            )
+            with contextlib.suppress(Exception):
+                self.append_status(card, f"💰 Стоимость изменена: {saved} ({who})")
+        except Exception:
+            traceback.print_exc()
+            self.bot.reply_to(message, FAILED)
 
     def bot_func(self):
         @self.bot.message_handler(commands=["start"])
@@ -586,6 +778,65 @@ class Bot:
                 traceback.print_exc()
                 toast = FAILED
             self.answer(call, toast)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith("mv:"))
+        def move_action(call):
+            if not self.allowed(call.from_user):
+                self.answer(call)
+                return
+            try:
+                toast = self.handle_move_action(call)
+            except Exception:
+                traceback.print_exc()
+                toast = FAILED
+            self.answer(call, toast)
+
+        @self.bot.message_handler(commands=["find_rent"])
+        def find_rent(message):
+            if not self.allowed(message.from_user):
+                self.bot.reply_to(message, DENIED)
+                return
+            self.ask(
+                message.chat.id,
+                "За какой день показать аренды? Например «25.10». Любая команда — отмена",
+                show_day_rents,
+            )
+
+        def show_day_rents(message):
+            if not self.allowed(message.from_user):
+                self.bot.reply_to(message, DENIED)
+                return
+            text = (message.text or "").strip()
+            if not text or text.startswith("/"):
+                self.bot.reply_to(message, "Поиск отменён")
+                return
+            try:
+                day = Dates.parse_day(text, Dates.today())
+            except ValueError:
+                self.bot.reply_to(
+                    message, "Не понял дату, нужно «25.10» или «25.10.2026». /find_rent"
+                )
+                return
+            try:
+                start = Dates.start_of(day)
+                events = [
+                    event
+                    for event in Calendar().find_overlaps(start, start + datetime.timedelta(days=1))
+                    if start <= Dates.event_bounds(event)[0]
+                ]
+                if not events:
+                    self.bot.reply_to(message, f"{Dates.format_day(day)}: аренд нет")
+                    return
+                self.bot.reply_to(message, f"{Dates.format_day(day)}: {Income.rents(len(events))}")
+                for event in events[:UNTREATED_CARDS]:
+                    self.bot.send_message(
+                        message.chat.id,
+                        booking_card(event),
+                        reply_markup=self.booking_markup(event),
+                    )
+            except Exception:
+                traceback.print_exc()
+                self.bot.reply_to(message, FAILED)
 
         def tariff_field_title(data, day, field):
             splitter = data[day]["splitter"]

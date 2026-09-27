@@ -44,5 +44,36 @@ class DatesTest(unittest.TestCase):
         self.assertEqual(Dates.format_hours(start, end), "2,5 ч")
 
 
+class ParseMoveTest(unittest.TestCase):
+    TODAY = datetime.date(2026, 9, 27)
+
+    def test_keeps_duration_when_hours_missing(self):
+        self.assertEqual(
+            Dates.parse_move("25.10 19:30", self.TODAY),
+            (datetime.datetime(2026, 10, 25, 19, 30), None),
+        )
+
+    def test_hours_year_and_bare_hour(self):
+        self.assertEqual(
+            Dates.parse_move(" 5.1.2027 19 2,5 ", self.TODAY),
+            (datetime.datetime(2027, 1, 5, 19), 2.5),
+        )
+
+    def test_year_is_the_nearest_one(self):
+        self.assertEqual(
+            Dates.parse_day("05.01", datetime.date(2026, 12, 20)), datetime.date(2027, 1, 5)
+        )
+        self.assertEqual(Dates.parse_day("20.09", self.TODAY), datetime.date(2026, 9, 20))
+        # No leap year nearby: the year has to be typed
+        self.assertEqual(Dates.parse_day("29.02.28", self.TODAY), datetime.date(2028, 2, 29))
+        with self.assertRaises(ValueError):
+            Dates.parse_day("29.02", self.TODAY)
+
+    def test_rejects_garbage(self):
+        for text in ("завтра", "25.10", "32.10 19:00", "25.10 25:00", "25.10 19:30 три"):
+            with self.assertRaises(ValueError, msg=text):
+                Dates.parse_move(text, self.TODAY)
+
+
 if __name__ == "__main__":
     unittest.main()

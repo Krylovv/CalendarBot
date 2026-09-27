@@ -71,6 +71,22 @@ def recorded_summ(event):
         return None
 
 
+def summ_after_move(event, start, end):
+    # A sum still equal to the tariff estimate follows the booking to its new time; a sum
+    # typed by hand (or none at all) stays as is
+    summ = recorded_summ(event)
+    bounds = Dates.event_bounds(event)
+    if summ is None or not bounds or summ != Parser.get_summ(*bounds):
+        return summ
+    return Parser.get_summ(start, end)
+
+
+def set_description_field(description, key, value):
+    # Rewrites a "key: value" line of a bot description; other descriptions are left alone
+    pattern = re.compile(rf"^{re.escape(key)}: .*$", re.MULTILINE)
+    return pattern.sub(lambda _: f"{key}: {value}", description or "", count=1)
+
+
 def money(value):
     return f"{value:,}".replace(",", " ")
 

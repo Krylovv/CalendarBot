@@ -1,3 +1,4 @@
+import datetime
 import unittest
 
 from support import timed_event, use_tariffs
@@ -5,6 +6,7 @@ from support import timed_event, use_tariffs
 import Income
 
 MON = "2026-09-21T"
+HOURS_2 = datetime.timedelta(hours=2)
 
 
 class RecordedSummTest(unittest.TestCase):
@@ -102,6 +104,35 @@ class MonthTest(unittest.TestCase):
             [Income.rents(n) for n in (1, 2, 5, 11, 21, 22)],
             ["1 аренда", "2 аренды", "5 аренд", "11 аренд", "21 аренда", "22 аренды"],
         )
+
+
+class MoveTest(unittest.TestCase):
+    def setUp(self):
+        use_tariffs(self)
+
+    def test_tariff_sum_follows_the_booking(self):
+        # Mon 19:00-21:00 = 2 * 4500; Sat 19:00-21:00 = 2 * 5000
+        event = timed_event(
+            MON + "19:00:00+03:00", MON + "21:00:00+03:00", private={"summ": "9000"}
+        )
+        start = datetime.datetime(2026, 9, 26, 19)
+        self.assertEqual(Income.summ_after_move(event, start, start + HOURS_2), 10000)
+
+    def test_discount_and_missing_sum_stay(self):
+        start = datetime.datetime(2026, 9, 26, 19)
+        for private in ({"summ": "7000"}, {"summ": "0"}, None):
+            event = timed_event(MON + "19:00:00+03:00", MON + "21:00:00+03:00", private=private)
+            self.assertEqual(
+                Income.summ_after_move(event, start, start + HOURS_2), Income.recorded_summ(event)
+            )
+
+    def test_description_field(self):
+        description = "type: automated\nsumm: 9000\ncomment: \n"
+        self.assertEqual(
+            Income.set_description_field(description, "comment", "поздно"),
+            "type: automated\nsumm: 9000\ncomment: поздно\n",
+        )
+        self.assertEqual(Income.set_description_field("@ivan", "summ", 1), "@ivan")
 
 
 if __name__ == "__main__":
