@@ -132,7 +132,7 @@ def split_month(events):
             continue
         summ = recorded_summ(event)
         if summ == 0:
-            # Explicitly marked as "not a rent"
+            # Free, or marked "not a rent" before the /monthly_income buttons were removed
             continue
         if summ is None:
             estimated.append((event, Parser.get_summ(*bounds), bounds))
@@ -161,5 +161,4 @@ def format_report(year, month, recorded, estimated):
         lines += ["", "Без записанной суммы (оценка):"]
         for event, summ, bounds in estimated:
             lines.append(f"• {Dates.format_span(*bounds)} {title(event)} — ~{money(summ)} ₽")
-        lines += ["", "Нажмите на событие ниже, чтобы записать точную сумму."]
     return "\n".join(lines)

@@ -46,7 +46,7 @@ class RowsTest(unittest.TestCase):
             ),
             # Made by hand, unknown if confirmed: listed with an estimate
             timed_event(MON + "10:00:00+03:00", MON + "12:00:00+03:00", summary="Анна"),
-            # Made by hand with a sum recorded in /monthly_income
+            # Made by hand with a recorded sum
             timed_event(
                 "2026-09-22T19:00:00+03:00",
                 "2026-09-22T20:00:00+03:00",

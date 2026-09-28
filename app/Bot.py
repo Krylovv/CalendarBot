@@ -39,7 +39,7 @@ ABOUT = """Что умеет бот
 /next_week_rents — аренды на следующую неделю (пн–вс)
 /untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить, ❌ Отменить и ✏️ Изменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
 /find_rent — аренды за указанный день с теми же кнопками, в том числе подтверждённые
-/monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы. Кнопками ✏️ можно записать точную сумму или отметить, что это не аренда
+/monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы
 /monthly_report — прямо сейчас собрать отчёт за текущий месяц (с 1-го числа) на новом листе таблицы заявок. Если лист уже есть, бот предложит собрать его заново
 /tariffs — посмотреть и изменить тарифы
 /about — эта справка
@@ -330,14 +330,7 @@ class Bot:
 
     def send_income_report(self, chat_id, year, month):
         recorded, estimated = Income.split_month(Calendar().get_events_for_month(year, month))
-        markup = None
-        if estimated:
-            markup = types.InlineKeyboardMarkup()
-            # Telegram allows up to 100 buttons per message
-            for event, _, bounds in estimated[:90]:
-                label = f"✏️ {bounds[0]:%d.%m %H:%M} {Income.title(event)}"[:60]
-                markup.add(button(label, self.event_callback("inc:s", event["id"])))
-        self.send_long(chat_id, Income.format_report(year, month, recorded, estimated), markup)
+        self.send_long(chat_id, Income.format_report(year, month, recorded, estimated))
 
     def send_report(self, chat_id, year, month, replace=False):
         title, totals = Spreadsheets().build_report(year, month, replace)
@@ -861,60 +854,9 @@ class Bot:
                 elif action == "m":
                     year, month = map(int, value.split("-"))
                     self.send_income_report(chat_id, year, month)
-                elif action == "s":
-                    event_id = self.resolve_event_id(value)
-                    if event_id is None:
-                        self.bot.send_message(chat_id, "Кнопка устарела, запросите отчёт заново")
-                        return
-                    event = Calendar().find_event(event_id)
-                    bounds = event and Dates.event_bounds(event)
-                    if not bounds:
-                        self.bot.send_message(chat_id, "Событие уже удалено из календаря")
-                        return
-                    estimate = Parser.get_summ(*bounds)
-                    self.ask(
-                        chat_id,
-                        f"{Income.title(event)}, {Dates.format_span(*bounds)}\n"
-                        f"Оценка по тарифам: {Income.money(estimate)} ₽\n"
-                        "Отправьте сумму в рублях, «+» — записать оценку, «0» — это не аренда",
-                        save_event_summ,
-                        event_id,
-                        estimate,
-                        bounds[0],
-                    )
             except Exception:
                 traceback.print_exc()
                 self.bot.send_message(chat_id, FAILED)
-
-        def save_event_summ(message, event_id, estimate, start):
-            if not self.allowed(message.from_user):
-                self.bot.reply_to(message, DENIED)
-                return
-            text = (message.text or "").strip()
-            if not text or text.startswith("/"):
-                self.bot.reply_to(message, "Изменение отменено")
-                return
-            try:
-                value = estimate if text == "+" else int(text.replace(" ", ""))
-            except ValueError:
-                value = -1
-            if not 0 <= value <= 10000000:
-                self.bot.reply_to(message, "Некорректная сумма, изменение отменено")
-                return
-            try:
-                Calendar().set_event_summ(event_id, value)
-                markup = types.InlineKeyboardMarkup()
-                markup.add(
-                    button(
-                        f"🔄 Отчёт за {Dates.MONTHS[start.month - 1]} {start.year}",
-                        f"inc:m:{start.year}-{start.month:02d}",
-                    )
-                )
-                saved = "не аренда" if value == 0 else Income.money(value) + " ₽"
-                self.bot.reply_to(message, f"Сохранено: {saved}", reply_markup=markup)
-            except Exception:
-                traceback.print_exc()
-                self.bot.reply_to(message, FAILED)
 
         @self.bot.message_handler(commands=["monthly_report"])
         def monthly_report(message):

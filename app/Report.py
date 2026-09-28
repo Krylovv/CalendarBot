@@ -62,7 +62,7 @@ def report_rows(events):
         if summ is None:
             summ, comment = Parser.get_summ(*bounds), comment or ESTIMATE_NOTE
         if summ == 0:
-            # Marked "not a rent" in /monthly_income
+            # Free, or marked "not a rent" before the /monthly_income buttons were removed
             continue
         rows.append((bounds[0], Income.strip_untreated(Income.title(event)), summ, comment))
     rows.sort(key=lambda row: row[0])
