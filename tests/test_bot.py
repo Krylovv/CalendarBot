@@ -20,10 +20,14 @@ from Bot import (
     format_event,
     invoice_message,
     move_preview,
+    new_rent_preview,
     next_week_text,
+    report_callback,
     report_text,
     split_message,
+    tg_username,
 )
+from Parser import Parser
 
 
 class AboutTest(unittest.TestCase):
@@ -89,6 +93,9 @@ class CallbackDataTest(unittest.TestCase):
 
 
 class FormattingTest(unittest.TestCase):
+    def setUp(self):
+        use_tariffs(self)
+
     def test_booking_card(self):
         event = timed_event(
             "2026-09-23T19:30:00+03:00",
@@ -218,7 +225,7 @@ class MoveTest(unittest.TestCase):
                 "Иван · @ivan · 5 чел.",
                 "Было: 23.09 ср 19:30–23:30 (4 ч)",
                 "Станет: 03.10 сб 21:00–23:30 (2,5 ч)",
-                "Сумма по тарифу: 18 000 → 12 500 ₽",
+                "Сумма по тарифу: 18 000 → 12 500 ₽ (2,5 ч × 5 000)",
                 "⚠️ Пересекается: 03.10 сб 22:00–00:00 Пётр",
                 "⚠️ Аренда выходит за рамки рабочего дня",
                 "Публичная копия тоже будет перенесена",
@@ -327,6 +334,7 @@ class InvoiceTest(unittest.TestCase):
         )
         self.assertEqual(
             invoice_message(event),
+            "Аренда 23.09 ср 19:30–23:30\n"
             "По стоимости у вас получится 18 000 ₽\nПредоплата: https://pay/inv1",
         )
         self.assertNotIn("@ivan", invoice_message(event))
@@ -417,6 +425,85 @@ class InvoiceTest(unittest.TestCase):
         _, note = self.bot.invoice_after_summ_change(self.calendar, with_invoice(bot_booking()))
         self.assertIsNone(note)
         self.calendar.close_invoice.assert_not_called()
+
+
+class CardExtrasTest(unittest.TestCase):
+    def setUp(self):
+        use_tariffs(self)
+        self.bot = Bot.__new__(Bot)
+        self.bot.callback_ids = {}
+
+    def links(self, tg):
+        event = bot_booking()
+        event["description"] = event["description"].replace("@ivan", tg)
+        markup = self.bot.booking_markup(event)
+        return [key.url for row in markup.keyboard for key in row if key.url]
+
+    def test_tg_username(self):
+        for value in ("@ivan_p", "ivan_p", "t.me/ivan_p", "https://t.me/ivan_p/", " @ivan_p "):
+            self.assertEqual(tg_username(value), "ivan_p", value)
+        for value in ("+79991234567", "Иван", "@ab", "@ivan p", "", None, "@1ivan"):
+            self.assertIsNone(tg_username(value), value)
+
+    def test_write_button_only_for_valid_username(self):
+        self.assertEqual(self.links("@ivan_p"), ["https://t.me/ivan_p"])
+        self.assertEqual(self.links("89991234567"), [])
+
+    def test_tariff_breakdown_in_card(self):
+        # Mon 17:30-19:30: 30 min at 4000 and 90 min at 4500
+        event = timed_event(
+            "2026-09-21T17:30:00+03:00",
+            "2026-09-21T19:30:00+03:00",
+            description="type: automated\ntg: @ivan\npeople: 5\nsumm: 8750\n",
+            private={"source": "calendarbot", "summ": "8750"},
+        )
+        self.assertIn("Сумма: 8 750 ₽ (0,5 ч × 4 000 + 1,5 ч × 4 500)", booking_card(event))
+        # A sum set by hand has no breakdown
+        event["extendedProperties"]["private"]["summ"] = "8000"
+        self.assertIn("Сумма: 8 000 ₽\n", booking_card(event) + "\n")
+
+
+class NewRentTest(unittest.TestCase):
+    def setUp(self):
+        use_tariffs(self)
+        now = mock.patch("Dates.now", return_value=datetime.datetime(2026, 9, 20, 12))
+        now.start()
+        self.addCleanup(now.stop)
+
+    def test_preview(self):
+        start, end = datetime.datetime(2026, 9, 21, 17, 30), datetime.datetime(2026, 9, 21, 23, 30)
+        result = Parser.booking({"name": "Иван Петров", "tg": "", "people": "5"}, start, end)
+        other = timed_event(
+            "2026-09-21T22:00:00+03:00", "2026-09-22T00:00:00+03:00", summary="Пётр"
+        )
+        self.assertEqual(
+            new_rent_preview(result, start, end, [other]).splitlines(),
+            [
+                "🆕 Добавить аренду?",
+                "Иван Петров · 5 чел.",
+                "21.09 пн 17:30–23:30 (6 ч)",
+                "Сумма по тарифу: 26 750 ₽ (0,5 ч × 4 000 + 5,5 ч × 4 500)",
+                "⚠️ Пересекается: 21.09 пн 22:00–00:00 Пётр",
+                "⚠️ Аренда выходит за рамки рабочего дня",
+            ],
+        )
+
+
+class ReportCallbackTest(unittest.TestCase):
+    def test_actions(self):
+        self.assertEqual(report_callback("rep:m:2026-09"), ("m", "2026-09"))
+        self.assertEqual(report_callback("rep:y:2025"), ("y", "2025"))
+        self.assertEqual(report_callback("rep:r:2026-09"), ("r", "2026-09"))
+        # Rebuild buttons sent before the month picker
+        self.assertEqual(report_callback("rep:2026-09"), ("r", "2026-09"))
+
+    def test_month_picker_prefix(self):
+        bot = Bot.__new__(Bot)
+        markup = bot.month_picker(2026, "rep")
+        data = [key.callback_data for row in markup.keyboard for key in row]
+        self.assertIn("rep:m:2026-09", data)
+        self.assertIn("rep:y:2025", data)
+        self.assertTrue(all(value.startswith("rep:") for value in data))
 
 
 if __name__ == "__main__":

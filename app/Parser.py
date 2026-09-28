@@ -1,6 +1,6 @@
 import datetime
-import json
 
+import Dates
 import Tariffs
 
 
@@ -26,16 +26,24 @@ class Parser:
             + "-"
             + result_dict["date"].split("-")[0]
         )
-        # Блок форматирования словаря под datetime формат и проверки времени работы
         rent_start = self.parse_start(result_dict["date"], result_dict["time"])
         rent_end = rent_start + datetime.timedelta(hours=int(result_dict["hours"]))
-        # Функция подсчета суммы
-        result_dict["summ"] = str(self.get_summ(rent_start, rent_end))
+        return self.booking(result_dict, rent_start, rent_end)
+
+    @staticmethod
+    def booking(fields, rent_start, rent_end):
+        # fields: name, tg, people and optionally date and hours as typed (they are part of the
+        # event ID, so a row keeps its own spelling); the rest is computed
+        result_dict = dict(fields)
+        result_dict.setdefault("date", str(rent_start.date()))
+        hours = (rent_end - rent_start) / datetime.timedelta(hours=1)
+        result_dict.setdefault("hours", f"{hours:g}")
+        result_dict["summ"] = str(Parser.get_summ(rent_start, rent_end))
         result_dict["end_date"] = str(rent_end.date())
         result_dict["end_time"] = str(rent_end.time())
-        result_dict["comment"] = self.check_working_hours(rent_start, rent_end)
+        result_dict["comment"] = Parser.check_working_hours(rent_start, rent_end)
         result_dict["time"] = rent_start.strftime("%H:%M:%S")
-        result_dict["description"] = self.description(result_dict)
+        result_dict["description"] = Parser.description(result_dict)
         return result_dict
 
     @staticmethod
@@ -59,7 +67,9 @@ class Parser:
         return datetime.datetime.strptime(date, "%Y-%m-%d").replace(hour=hour, minute=minute)
 
     @staticmethod
-    def get_summ(rent_start, rent_end):
+    def summ_parts(rent_start, rent_end):
+        # -> [(hours, price per hour), ...] before and after the tariff switch hour, without
+        # empty parts. Charged by the minute on each side of the switch
         tariffication_dict = Tariffs.load()
         day = rent_start.weekday()
         if day <= 3:
@@ -70,27 +80,38 @@ class Parser:
             day = "weekend"
         pricing = tariffication_dict[day]
         price_before, price_after = pricing["price"]
-        # Charge by the minute on each side of the tariff switch hour
         day_start = datetime.datetime.combine(rent_start.date(), datetime.time())
         switch = day_start + datetime.timedelta(hours=pricing["splitter"])
         before = max(min(rent_end, switch) - rent_start, datetime.timedelta())
         after = (rent_end - rent_start) - before
         hour = datetime.timedelta(hours=1)
-        return round(before / hour * price_before + after / hour * price_after)
+        parts = [(before / hour, price_before), (after / hour, price_after)]
+        return [(hours, price) for hours, price in parts if hours > 0]
+
+    @staticmethod
+    def get_summ(rent_start, rent_end):
+        return round(sum(hours * price for hours, price in Parser.summ_parts(rent_start, rent_end)))
 
     @staticmethod
     def description(result_dict):
-        try:
-            tg = result_dict["tg"]
-            people = result_dict["people"]
-            summ = result_dict["summ"]
-            comment = result_dict["comment"]
-            d = f'"type": "automated", "tg": "{tg}", "people": {people}, "summ": {summ}, "comment": "{comment}"'
-            d = "{" + d + "}"
-            d = json.loads(d)
-            s = ""
-            for key in d:
-                s += key + ": " + str(d[key]) + "\n"
-            return s
-        except Exception:
-            return
+        fields = ("tg", "people", "summ", "comment")
+        return "type: automated\n" + "".join(
+            f"{field}: {result_dict.get(field, '')}\n" for field in fields
+        )
+
+
+# "25.10 19:30 3 Иван Петров @ivan 5": date, time and hours first, then the name; a word with
+# "@" or "t.me/" is the Telegram contact, a trailing number is the number of people
+def parse_manual_rent(text, today):
+    # -> (start, hours, name, tg, people); ValueError if the date, time, hours or name is missing
+    words = text.split()
+    start, hours = Dates.parse_move(" ".join(words[:3]), today)
+    if hours is None:
+        raise ValueError("hours are required")
+    rest = words[3:]
+    contacts = [word for word in rest if word.startswith("@") or "t.me/" in word]
+    rest = [word for word in rest if word not in contacts]
+    people = rest.pop() if rest and rest[-1].isdigit() else ""
+    if not rest:
+        raise ValueError("name is required")
+    return start, hours, " ".join(rest), " ".join(contacts), people

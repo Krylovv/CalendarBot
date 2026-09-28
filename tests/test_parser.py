@@ -1,8 +1,9 @@
+import datetime
 import unittest
 
 from support import use_tariffs
 
-from Parser import Parser
+from Parser import Parser, parse_manual_rent
 
 
 def booking(time, hours=2, date="21-09-2026", tg="@ivan"):
@@ -47,6 +48,66 @@ class ParserTest(unittest.TestCase):
 
     def test_description_carries_sum(self):
         self.assertIn("summ: 8750\n", booking("17:30")["description"])
+
+    def test_booking_matches_parse(self):
+        # Same fields as a sheet row, but a Parser.booking call: the ID fields must not change
+        parsed = booking("17:30")
+        built = Parser.booking(
+            {"name": "Иван", "tg": "@ivan", "people": "4", "date": "2026-09-21", "hours": "2"},
+            datetime.datetime(2026, 9, 21, 17, 30),
+            datetime.datetime(2026, 9, 21, 19, 30),
+        )
+        self.assertEqual(built, parsed)
+
+    def test_booking_fills_date_and_fractional_hours(self):
+        result = Parser.booking(
+            {"name": "Иван", "tg": "", "people": ""},
+            datetime.datetime(2026, 9, 21, 17, 30),
+            datetime.datetime(2026, 9, 21, 20, 0),
+        )
+        self.assertEqual((result["date"], result["hours"]), ("2026-09-21", "2.5"))
+        self.assertEqual(result["summ"], "11000")
+        self.assertIn("tg: \npeople: \n", result["description"])
+
+    def test_summ_parts(self):
+        monday = datetime.datetime(2026, 9, 21)
+        self.assertEqual(
+            Parser.summ_parts(
+                monday.replace(hour=17, minute=30), monday.replace(hour=19, minute=30)
+            ),
+            [(0.5, 4000), (1.5, 4500)],
+        )
+        self.assertEqual(
+            Parser.summ_parts(monday.replace(hour=19), monday.replace(hour=21)), [(2.0, 4500)]
+        )
+        self.assertEqual(
+            Parser.summ_parts(monday.replace(hour=12), monday.replace(hour=14)), [(2.0, 4000)]
+        )
+
+
+class ManualRentTest(unittest.TestCase):
+    TODAY = datetime.date(2026, 9, 28)
+
+    def test_full(self):
+        self.assertEqual(
+            parse_manual_rent("25.10 19:30 3 Иван Петров @ivan 5", self.TODAY),
+            (datetime.datetime(2026, 10, 25, 19, 30), 3.0, "Иван Петров", "@ivan", "5"),
+        )
+
+    def test_optional_and_reordered_fields(self):
+        self.assertEqual(
+            parse_manual_rent("25.10 19 2,5 Анна", self.TODAY),
+            (datetime.datetime(2026, 10, 25, 19), 2.5, "Анна", "", ""),
+        )
+        self.assertEqual(
+            parse_manual_rent("25.10.2026 19:00 2 t.me/anna Анна 4", self.TODAY)[2:],
+            ("Анна", "t.me/anna", "4"),
+        )
+
+    def test_errors(self):
+        for text in ("25.10 19:30 Иван", "25.10 19:30 3", "25.10 19:30 3 7", "завтра", ""):
+            with self.assertRaises(ValueError, msg=text):
+                parse_manual_rent(text, self.TODAY)
 
 
 if __name__ == "__main__":

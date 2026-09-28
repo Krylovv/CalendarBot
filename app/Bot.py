@@ -1,6 +1,7 @@
 import contextlib
 import datetime
 import itertools
+import re
 import time
 import traceback
 
@@ -12,7 +13,7 @@ import Tariffs
 import telebot
 from Calendar import OVERLAP_NOTE, Calendar, EventExists
 from googleapiclient.errors import HttpError
-from Parser import Parser
+from Parser import Parser, parse_manual_rent
 from Spreadsheet import Spreadsheets
 from telebot import types
 
@@ -27,6 +28,7 @@ COMMANDS = [
     ("next_week_rents", "Посмотреть аренды на следующую неделю"),
     ("untreated_rents", "Посмотреть необработанные аренды"),
     ("find_rent", "Найти аренду по дате, чтобы изменить или отменить"),
+    ("add_rent", "Добавить аренду вручную"),
     ("monthly_income", "Доход за месяц"),
     ("monthly_report", "Собрать отчёт за месяц в таблицу"),
     ("tariffs", "Посмотреть и изменить тарифы"),
@@ -39,8 +41,9 @@ ABOUT = """Что умеет бот
 /next_week_rents — аренды на следующую неделю (пн–вс) и отдельно неоплаченные
 /untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить, ❌ Отменить и ✏️ Изменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
 /find_rent — аренды за указанный день с теми же кнопками, в том числе подтверждённые
+/add_rent — добавить аренду без сайта одной строкой: «25.10 19:30 3 Иван @ivan 5» (дата, время, часы, имя, телеграм и число людей — последние два можно пропустить). Бот покажет сумму и пересечения и создаст событие после подтверждения
 /monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы
-/monthly_report — прямо сейчас собрать отчёт за текущий месяц (с 1-го числа) на новом листе таблицы заявок. Если лист уже есть, бот предложит собрать его заново
+/monthly_report — собрать отчёт за выбранный месяц на новом листе таблицы заявок. Если лист уже есть, бот предложит собрать его заново
 /tariffs — посмотреть и изменить тарифы
 /about — эта справка
 
@@ -66,6 +69,9 @@ MESSAGE_LIMIT = 4096
 # Telegram's flood limit (429), so the rest come on the next request
 UNTREATED_CARDS = 10
 CALLBACK_LIMIT = 64
+# A Telegram username as people type it: "@name", "name", "t.me/name" or "https://t.me/name".
+# Tenants often give a phone or a misspelt name instead; then there is no "write" button
+TG_USERNAME = re.compile(r"^(?:(?:https?://)?t\.me/|@)?([A-Za-z][A-Za-z0-9_]{4,31})/?$")
 
 
 def describe_error(error):
@@ -95,6 +101,19 @@ def split_message(text, limit=MESSAGE_LIMIT):
     if current is not None:
         chunks.append(current)
     return [chunk for chunk in chunks if chunk.strip()] or [text]
+
+
+def tg_username(value):
+    match = TG_USERNAME.match((value or "").strip())
+    return match.group(1) if match else None
+
+
+def tariff_breakdown(start, end):
+    # "1,5 ч × 4 000 + 2 ч × 4 500"
+    return " + ".join(
+        f"{round(hours, 2):g} ч × {Income.money(price)}".replace(".", ",")
+        for hours, price in Parser.summ_parts(start, end)
+    )
 
 
 def button(text, data):
@@ -148,7 +167,10 @@ def move_preview(event, start, end, conflicts):
     lines.append(f"Станет: {Dates.format_span(start, end)} ({Dates.format_hours(start, end)})")
     summ, new_summ = Income.recorded_summ(event), Income.summ_after_move(event, start, end)
     if summ is not None and new_summ != summ:
-        lines.append(f"Сумма по тарифу: {Income.money(summ)} → {Income.money(new_summ)} ₽")
+        lines.append(
+            f"Сумма по тарифу: {Income.money(summ)} → {Income.money(new_summ)} ₽ "
+            f"({tariff_breakdown(start, end)})"
+        )
     elif summ is not None:
         lines.append(f"Сумма: {Income.money(summ)} ₽")
         estimate = Parser.get_summ(start, end)
@@ -168,6 +190,34 @@ def move_preview(event, start, end, conflicts):
     if Income.is_published(event):
         lines.append("Публичная копия тоже будет перенесена")
     return "\n".join(lines)
+
+
+def new_rent_preview(result, start, end, conflicts):
+    people = result["people"] and result["people"] + " чел."
+    lines = [
+        "🆕 Добавить аренду?",
+        " · ".join(filter(None, [result["name"], result["tg"], people])),
+        f"{Dates.format_span(start, end)} ({Dates.format_hours(start, end)})",
+        f"Сумма по тарифу: {Income.money(int(result['summ']))} ₽ ({tariff_breakdown(start, end)})",
+    ]
+    for other in conflicts:
+        lines.append(
+            f"⚠️ Пересекается: {Dates.format_span(*Dates.event_bounds(other))} {Income.title(other)}"
+        )
+    if result["comment"]:
+        lines.append("⚠️ " + result["comment"])
+    if start < Dates.now():
+        lines.append("⚠️ Это время уже прошло")
+    return "\n".join(lines)
+
+
+def report_callback(data):
+    # "rep:m:2026-09" pick, "rep:y:2026" year, "rep:r:2026-09" rebuild; buttons sent before the
+    # picker existed carry only "rep:2026-09" and meant rebuild
+    parts = data.split(":")
+    if len(parts) == 2:
+        return "r", parts[1]
+    return parts[1], parts[2]
 
 
 def report_text(year, month, title, totals):
@@ -215,7 +265,9 @@ def invoice_message(event):
     # Made to be forwarded to the tenant as is: no internal details. Test mode is marked on
     # the booking card instead
     invoice = Income.invoice(event)
-    return f"По стоимости у вас получится {invoice_summ(invoice)} ₽\nПредоплата: {invoice['url']}"
+    text = f"По стоимости у вас получится {invoice_summ(invoice)} ₽\nПредоплата: {invoice['url']}"
+    bounds = Dates.event_bounds(event)
+    return f"Аренда {Dates.format_span(*bounds)}\n{text}" if bounds else text
 
 
 def unpaid_line(event):
@@ -259,7 +311,11 @@ def booking_card(event, conflicts=()):
         lines.append(f"{Dates.format_span(*bounds)} ({Dates.format_hours(*bounds)})")
     summ = Income.recorded_summ(event)
     if summ is not None:
-        lines.append(f"Сумма: {Income.money(summ)} ₽")
+        line = f"Сумма: {Income.money(summ)} ₽"
+        # A sum set by hand (a discount) has no breakdown
+        if bounds and summ and summ == Parser.get_summ(*bounds):
+            line += f" ({tariff_breakdown(*bounds)})"
+        lines.append(line)
     invoice = invoice_line(event)
     if invoice:
         lines.append(invoice)
@@ -287,6 +343,8 @@ class Bot:
         # Moves waiting for confirmation: token -> (event_id, start, end, booking card message)
         self.moves = {}
         self.move_tokens = itertools.count()
+        # Manual bookings waiting for confirmation: token -> Parser.booking result
+        self.new_rents = {}
 
     # --- helpers shared by handlers and sync notifications
 
@@ -340,8 +398,14 @@ class Bot:
         ):
             edits.append(button("💳 Счёт", self.event_callback("bk:iv", event["id"])))
         markup.row(*edits)
+        links = []
         if event.get("htmlLink"):
-            markup.add(types.InlineKeyboardButton("Открыть в календаре", url=event["htmlLink"]))
+            links.append(types.InlineKeyboardButton("Открыть в календаре", url=event["htmlLink"]))
+        username = tg_username(description_fields(event).get("tg"))
+        if username:
+            links.append(types.InlineKeyboardButton("✉️ Написать", url=f"https://t.me/{username}"))
+        if links:
+            markup.row(*links)
         return markup
 
     def next_week_markup(self, events):
@@ -358,7 +422,7 @@ class Bot:
             markup.add(button(label[:60], self.event_callback("bk:card", event["id"])))
         return markup
 
-    def month_picker(self, year):
+    def month_picker(self, year, prefix="inc"):
         markup = types.InlineKeyboardMarkup(row_width=3)
         today = Dates.today()
         months = []
@@ -366,11 +430,11 @@ class Bot:
             label = Dates.MONTHS_SHORT[month - 1]
             if (year, month) == (today.year, today.month):
                 label = "• " + label
-            months.append(button(label, f"inc:m:{year}-{month:02d}"))
+            months.append(button(label, f"{prefix}:m:{year}-{month:02d}"))
         markup.add(*months)
         markup.row(
-            button(f"« {year - 1}", f"inc:y:{year - 1}"),
-            button(f"{year + 1} »", f"inc:y:{year + 1}"),
+            button(f"« {year - 1}", f"{prefix}:y:{year - 1}"),
+            button(f"{year + 1} »", f"{prefix}:y:{year + 1}"),
         )
         return markup
 
@@ -382,7 +446,7 @@ class Bot:
         title, totals = Spreadsheets().build_report(year, month, replace)
         if totals is None:
             markup = types.InlineKeyboardMarkup()
-            markup.add(button("🔄 Собрать заново", f"rep:{year}-{month:02d}"))
+            markup.add(button("🔄 Собрать заново", f"rep:r:{year}-{month:02d}"))
             self.bot.send_message(
                 chat_id,
                 f"Лист «{title}» уже есть. Собрать заново? Правки на листе пропадут",
@@ -819,6 +883,77 @@ class Bot:
             traceback.print_exc()
             self.bot.reply_to(message, FAILED)
 
+    # --- adding a booking by hand
+
+    def receive_new_rent(self, message, text=None):
+        if not self.allowed(message.from_user):
+            self.bot.reply_to(message, DENIED)
+            return
+        text = (message.text or "").strip() if text is None else text
+        if not text or text.startswith("/"):
+            self.bot.reply_to(message, "Добавление отменено")
+            return
+        try:
+            start, hours, name, tg, people = parse_manual_rent(text, Dates.today())
+        except ValueError:
+            self.bot.reply_to(
+                message,
+                "Не понял. Нужно «25.10 19:30 3 Иван @ivan 5»: дата, время, часы и имя, "
+                "телеграм и число людей можно пропустить. /add_rent",
+            )
+            return
+        if not 0 < hours <= Income.MAX_RENT_HOURS:
+            self.bot.reply_to(
+                message, f"Длительность — от 0 до {Income.MAX_RENT_HOURS} часов. /add_rent"
+            )
+            return
+        try:
+            end = start + datetime.timedelta(hours=hours)
+            result = Parser.booking({"name": name, "tg": tg, "people": people}, start, end)
+            conflicts = Calendar().find_overlaps(start, end)
+            token = str(next(self.move_tokens))
+            self.new_rents[token] = result
+            markup = types.InlineKeyboardMarkup()
+            markup.row(
+                button("✅ Создать", f"add:ok:{token}"), button("Не создавать", f"add:no:{token}")
+            )
+            self.bot.reply_to(
+                message, new_rent_preview(result, start, end, conflicts), reply_markup=markup
+            )
+        except Exception:
+            traceback.print_exc()
+            self.bot.reply_to(message, FAILED)
+
+    def handle_new_rent_action(self, call):
+        _, action, token = call.data.split(":", 2)
+        # Popped first, so a double tap can't create twice
+        result = self.new_rents.pop(token, None)
+        if result is None:
+            return "Кнопка устарела"
+        if action == "no":
+            self.append_status(call.message, "Не добавлено")
+            return None
+        chat_id, message_id = call.message.chat.id, call.message.message_id
+        calendar = Calendar()
+        try:
+            event, conflicts = calendar.create_event(result)
+            header = f"🆕 Добавлено ({call.from_user.first_name or 'без имени'})"
+        except EventExists as exists:
+            event, conflicts = calendar.find_event(exists.event_id), []
+            if event is None:
+                self.bot.edit_message_text(
+                    "Эта аренда уже создавалась и была отменена", chat_id, message_id
+                )
+                return None
+            header = "Эта аренда уже есть в календаре"
+        self.bot.edit_message_text(
+            header + "\n" + booking_card(event, conflicts),
+            chat_id,
+            message_id,
+            reply_markup=self.booking_markup(event),
+        )
+        return "Добавлено"
+
     def bot_func(self):
         @self.bot.message_handler(commands=["start"])
         def start(message):
@@ -923,24 +1058,40 @@ class Bot:
             if not self.allowed(message.from_user):
                 self.bot.reply_to(message, DENIED)
                 return
-            today = Dates.today()
-            try:
-                self.send_report(message.chat.id, today.year, today.month)
-            except Exception:
-                traceback.print_exc()
-                self.bot.reply_to(message, FAILED)
+            year = Dates.today().year
+            self.bot.send_message(
+                message.chat.id,
+                f"За какой месяц собрать отчёт? ({year})",
+                reply_markup=self.month_picker(year, "rep"),
+            )
 
         @self.bot.callback_query_handler(func=lambda call: call.data.startswith("rep:"))
-        def rebuild_report(call):
+        def report_menu(call):
             self.answer(call)
             if not self.allowed(call.from_user):
                 return
             chat_id = call.message.chat.id
             try:
-                year, month = map(int, call.data.split(":", 1)[1].split("-"))
-                # Drop the button first, so a double tap can't rebuild the sheet twice
-                self.bot.edit_message_reply_markup(chat_id, call.message.message_id)
-                self.send_report(chat_id, year, month, replace=True)
+                action, value = report_callback(call.data)
+                if action == "y":
+                    year = int(value)
+                    self.bot.edit_message_text(
+                        f"За какой месяц собрать отчёт? ({year})",
+                        chat_id,
+                        call.message.message_id,
+                        reply_markup=self.month_picker(year, "rep"),
+                    )
+                    return
+                year, month = map(int, value.split("-"))
+                today = Dates.today()
+                if (year, month) > (today.year, today.month):
+                    self.bot.send_message(chat_id, "Этот месяц ещё не начался")
+                elif action == "m":
+                    self.send_report(chat_id, year, month)
+                elif action == "r":
+                    # Drop the button first, so a double tap can't rebuild the sheet twice
+                    self.bot.edit_message_reply_markup(chat_id, call.message.message_id)
+                    self.send_report(chat_id, year, month, replace=True)
             except Exception:
                 traceback.print_exc()
                 self.bot.send_message(chat_id, FAILED)
@@ -968,6 +1119,36 @@ class Bot:
                 traceback.print_exc()
                 toast = FAILED
             self.answer(call, toast)
+
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith("add:"))
+        def new_rent_action(call):
+            if not self.allowed(call.from_user):
+                self.answer(call)
+                return
+            try:
+                toast = self.handle_new_rent_action(call)
+            except Exception:
+                traceback.print_exc()
+                toast = FAILED
+            self.answer(call, toast)
+
+        @self.bot.message_handler(commands=["add_rent"])
+        def add_rent(message):
+            if not self.allowed(message.from_user):
+                self.bot.reply_to(message, DENIED)
+                return
+            # "/add_rent 25.10 19:30 3 Иван" works in one message too
+            text = (message.text or "").partition(" ")[2].strip()
+            if text:
+                self.receive_new_rent(message, text)
+                return
+            self.ask(
+                message.chat.id,
+                "Отправьте аренду одной строкой: «25.10 19:30 3 Иван Петров @ivan 5» — дата, "
+                "время, часы, имя, телеграм и число людей (последние два можно пропустить). "
+                "Любая команда — отмена",
+                self.receive_new_rent,
+            )
 
         @self.bot.message_handler(commands=["find_rent"])
         def find_rent(message):
