@@ -2,6 +2,7 @@ import datetime
 import re
 
 import Dates
+import Robokassa
 from Parser import Parser
 
 # Longer timed events (vacations, all-week holds) are not rentals
@@ -99,6 +100,13 @@ def invoice(event):
         "expires": private.get("invoice_expires", ""),
         "test": private.get("invoice_test") == "1",
     }
+
+
+def is_unpaid(event):
+    # Not confirmed yet, or confirmed by hand while its invoice still waits for payment.
+    # A confirmed booking is taken as paid: paying an invoice confirms it
+    current = invoice(event)
+    return is_untreated(event) or bool(current and current["status"] == Robokassa.NOT_PAID)
 
 
 def set_description_field(description, key, value):

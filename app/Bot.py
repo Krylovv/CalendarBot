@@ -36,7 +36,7 @@ COMMANDS = [
 ABOUT = """Что умеет бот
 
 📋 Команды
-/next_week_rents — аренды на следующую неделю (пн–вс)
+/next_week_rents — аренды на следующую неделю (пн–вс) и отдельно неоплаченные
 /untreated_rents — необработанные аренды на ближайшие полгода, у каждой кнопки ✅ Подтвердить, ❌ Отменить и ✏️ Изменить. Если уведомление потерялось, все ожидающие аренды можно найти здесь
 /find_rent — аренды за указанный день с теми же кнопками, в том числе подтверждённые
 /monthly_income — доход за выбранный месяц: записанные суммы плюс оценка по тарифам для событий без суммы
@@ -48,6 +48,7 @@ ABOUT = """Что умеет бот
 • Каждые 30 секунд бот проверяет таблицу заявок. Новая заявка становится событием «(не обработана)» в календаре, а в колонке P появляется TRUE.
 • О каждой новой аренде бот пишет сюда: время, сумма, пересечения с другими событиями и выход за рабочие часы (10:00–23:00). Кнопки: ✅ Подтвердить — копирует аренду в публичный календарь (только имя и время, без описания), убирает «(не обработана)» и дописывает в описание строку «public: yes»; ❌ Отменить — удаляет событие из обоих календарей; ✏️ Изменить — перенести на другую дату и время или поменять стоимость (например, для скидки).
 • При переносе бот показывает новое время, пересечения и сумму и ждёт подтверждения. Публичная копия переносится тоже. Сумма по тарифу пересчитывается, а изменённая вручную остаётся прежней. Строка в таблице заявок не меняется.
+• Каждый четверг в 10:00 бот присылает аренды на следующую неделю, отдельно — неоплаченные: не подтверждённые или со счётом, который ждёт оплаты.
 • В последний день месяца в 21:00 бот создаёт в таблице заявок лист «Месяц год» (имя, дата, сумма, комментарий, 20%, итог). В него попадают подтверждённые аренды (со строкой «public: yes» в описании) и события, созданные вручную: для них сумма по тарифам и комментарий «Не автоматизированная аренда». Готовый лист бот не перезаписывает.
 • 💳 Счёт (если подключена Robokassa и у аренды есть сумма) — бот выставляет счёт на сумму аренды на 7 дней и присылает сообщение со ссылкой: перешлите его арендатору. Повторное нажатие присылает ту же ссылку. После оплаты бот сам подтверждает бронь (как ✅, с копией в публичном календаре) и сообщает «💰 Оплачено» (проверяет раз в 5 минут). При отмене аренды или изменении суммы неоплаченный счёт отменяется.
 • Если строку не удалось разобрать, в колонке P появится «ОШИБКА: …» и придёт сообщение. Исправьте строку и очистите ячейку — бот попробует снова.
@@ -217,6 +218,37 @@ def invoice_message(event):
     return f"По стоимости у вас получится {invoice_summ(invoice)} ₽\nПредоплата: {invoice['url']}"
 
 
+def unpaid_line(event):
+    bounds = Dates.event_bounds(event)
+    when = Dates.format_span(*bounds) if bounds else format_event(event).splitlines()[0]
+    parts = [Income.strip_untreated(Income.title(event))]
+    summ = Income.recorded_summ(event)
+    if summ is not None:
+        parts.append(Income.money(summ) + " ₽")
+    invoice = Income.invoice(event)
+    if invoice is None:
+        parts.append("счёт не выставлен")
+    elif invoice["status"] == Robokassa.NOT_PAID:
+        parts.append(f"счёт до {invoice_expires(invoice)}")
+    else:
+        parts.append("счёт " + INVOICE_STATUSES.get(invoice["status"], invoice["status"]))
+    return f"• {when} " + " · ".join(parts)
+
+
+def next_week_text(start, events):
+    last_day = start + datetime.timedelta(days=6)
+    header = f"Аренды на следующую неделю ({start:%d.%m}–{last_day:%d.%m})"
+    if not events:
+        return header + ": нет"
+    text = f"{header}: {len(events)}\n\n" + "\n\n".join(format_event(event) for event in events)
+    unpaid = [event for event in events if Income.is_unpaid(event)]
+    if unpaid:
+        text += f"\n\n💳 Не оплачены ({len(unpaid)}):\n" + "\n".join(map(unpaid_line, unpaid))
+    else:
+        text += "\n\n💳 Неоплаченных нет"
+    return text
+
+
 def booking_card(event, conflicts=()):
     fields = description_fields(event)
     name = Income.strip_untreated(Income.title(event))
@@ -310,6 +342,20 @@ class Bot:
         markup.row(*edits)
         if event.get("htmlLink"):
             markup.add(types.InlineKeyboardButton("Открыть в календаре", url=event["htmlLink"]))
+        return markup
+
+    def next_week_markup(self, events):
+        # A button per unpaid rent: opens its booking card with the usual actions
+        unpaid = [event for event in events if Income.is_unpaid(event)]
+        if not unpaid:
+            return None
+        markup = types.InlineKeyboardMarkup()
+        # Telegram allows up to 100 buttons per message
+        for event in unpaid[:90]:
+            bounds = Dates.event_bounds(event)
+            when = f"{Dates.format_day(bounds[0])} {bounds[0]:%H:%M}" if bounds else ""
+            label = " · ".join(filter(None, [Income.strip_untreated(Income.title(event)), when]))
+            markup.add(button(label[:60], self.event_callback("bk:card", event["id"])))
         return markup
 
     def month_picker(self, year):
@@ -413,6 +459,15 @@ class Bot:
         self.notify_admins(
             f"⚠️ Не удалось создать отчёт за {Dates.MONTHS[month - 1]} {year}: "
             f"{describe_error(error)}\nБот повторяет попытки каждые 30 секунд."
+        )
+
+    def weekly_rents(self, start, events):
+        self.notify_admins("📅 " + next_week_text(start, events), self.next_week_markup(events))
+
+    def weekly_rents_failed(self, error):
+        self.notify_admins(
+            f"⚠️ Не удалось собрать аренды на следующую неделю: {describe_error(error)}\n"
+            "Бот повторяет попытки каждые 30 секунд."
         )
 
     def invoice_paid(self, event):
@@ -552,6 +607,15 @@ class Bot:
             return "Кнопка устарела"
         chat_id, message_id = call.message.chat.id, call.message.message_id
         who = call.from_user.first_name or "без имени"
+        if action == "card":
+            # From a list: the card comes as a new message, the list stays as is
+            event = Calendar().find_event(event_id)
+            if event is None:
+                return "Событие уже удалено"
+            self.bot.send_message(
+                chat_id, booking_card(event), reply_markup=self.booking_markup(event)
+            )
+            return None
         if action == "rm":
             # Deleting is irreversible: ask first
             self.bot.edit_message_reply_markup(
@@ -784,13 +848,9 @@ class Bot:
             try:
                 start, end = Dates.next_week_range(Dates.today())
                 events = Calendar().list_events(start, end)
-                if not events:
-                    self.bot.reply_to(message, "На следующей неделе аренд нет")
-                    return
-                last_day = end - datetime.timedelta(days=1)
-                header = f"Аренды на следующую неделю ({start:%d.%m}–{last_day:%d.%m}):"
-                body = "\n\n".join(format_event(event) for event in events)
-                self.send_long(message.chat.id, header + "\n\n" + body)
+                self.send_long(
+                    message.chat.id, next_week_text(start, events), self.next_week_markup(events)
+                )
             except Exception:
                 traceback.print_exc()
                 self.bot.reply_to(message, FAILED)

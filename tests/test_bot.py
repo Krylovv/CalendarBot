@@ -20,6 +20,7 @@ from Bot import (
     format_event,
     invoice_message,
     move_preview,
+    next_week_text,
     report_text,
     split_message,
 )
@@ -128,6 +129,47 @@ class FormattingTest(unittest.TestCase):
         }
         self.assertEqual(format_event(all_day), "27.09 вс весь день\nПраздник")
 
+    def test_next_week_text(self):
+        untreated = timed_event(
+            "2026-10-05T19:00:00+03:00",
+            "2026-10-05T21:00:00+03:00",
+            summary="Иван (не обработана)",
+            private={"summ": "9000"},
+        )
+        invoiced = timed_event(
+            "2026-10-06T12:00:00+03:00",
+            "2026-10-06T14:00:00+03:00",
+            summary="Пётр",
+            private={
+                "summ": "8000",
+                "invoice_id": "i1",
+                "invoice_status": "NotPaid",
+                "invoice_expires": "2026-10-03T12:00:00+03:00",
+            },
+        )
+        paid = timed_event(
+            "2026-10-07T12:00:00+03:00",
+            "2026-10-07T14:00:00+03:00",
+            summary="Анна",
+            private={"summ": "8000", "invoice_id": "i2", "invoice_status": "Paid"},
+        )
+        text = next_week_text(datetime.datetime(2026, 10, 5), [untreated, invoiced, paid])
+        self.assertTrue(text.startswith("Аренды на следующую неделю (05.10–11.10): 3\n\n"))
+        self.assertTrue(
+            text.endswith(
+                "💳 Не оплачены (2):\n"
+                "• 05.10 пн 19:00–21:00 Иван · 9 000 ₽ · счёт не выставлен\n"
+                "• 06.10 вт 12:00–14:00 Пётр · 8 000 ₽ · счёт до 03.10 12:00"
+            )
+        )
+        self.assertTrue(
+            next_week_text(datetime.datetime(2026, 10, 5), [paid]).endswith("Неоплаченных нет")
+        )
+        self.assertEqual(
+            next_week_text(datetime.datetime(2026, 10, 5), []),
+            "Аренды на следующую неделю (05.10–11.10): нет",
+        )
+
     def test_report_text(self):
         self.assertEqual(
             report_text(2026, 9, "Сентябрь 2026", (12, 180000, 36000)),
@@ -203,6 +245,35 @@ class MoveTest(unittest.TestCase):
             self.assertEqual(bot.handle_move_action(call), "Перенесено")
             self.assertEqual(bot.handle_move_action(call), "Кнопка устарела")
         calendar.return_value.move_event.assert_called_once_with("cb1", self.START, self.END)
+
+    def test_unpaid_buttons_open_booking_card(self):
+        bot = Bot.__new__(Bot)
+        bot.callback_ids, bot.bot = {}, mock.Mock()
+        untreated = bot_booking()
+        untreated["summary"] = "Иван (не обработана)"
+        confirmed = timed_event(
+            "2026-10-06T12:00:00+03:00", "2026-10-06T14:00:00+03:00", summary="Пётр", event_id="cb2"
+        )
+        markup = bot.next_week_markup([untreated, confirmed])
+        buttons = [row[0] for row in markup.keyboard]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0].text, "Иван · 23.09 ср 19:30")
+        self.assertEqual(buttons[0].callback_data, "bk:card:" + untreated["id"])
+        self.assertIsNone(bot.next_week_markup([confirmed]))
+        call = SimpleNamespace(
+            data=buttons[0].callback_data,
+            message=SimpleNamespace(chat=SimpleNamespace(id=1), message_id=2, text="список"),
+            from_user=SimpleNamespace(first_name="Аня"),
+        )
+        with mock.patch("Bot.Calendar") as calendar:
+            calendar.return_value.find_event.return_value = untreated
+            self.assertIsNone(bot.handle_booking_action(call))
+            calendar.return_value.find_event.return_value = None
+            self.assertEqual(bot.handle_booking_action(call), "Событие уже удалено")
+        # The card is a new message; the list itself is never edited
+        bot.bot.send_message.assert_called_once()
+        self.assertEqual(bot.bot.send_message.call_args[0][1], booking_card(untreated))
+        bot.bot.edit_message_text.assert_not_called()
 
 
 def with_invoice(event, status="NotPaid", summ="18000", test="1"):

@@ -1,10 +1,12 @@
 import datetime
+import tempfile
 import unittest
 from unittest import mock
 
 from support import timed_event, use_tariffs
 
 import Spreadsheet
+import Weekly
 from Calendar import EventExists
 
 ROW = ["Иван", "@ivan", "", "", "21-09-2026", "19:30", "2", "4"]
@@ -18,6 +20,7 @@ def bare_sheet():
     sheet.notifier = mock.Mock()
     sheet.report_done = sheet.report_alerted = None
     sheet.invoice_checked, sheet.invoice_alerted = None, False
+    sheet.weekly_alerted = None
     return sheet
 
 
@@ -110,7 +113,7 @@ class HealthAlertTest(unittest.TestCase):
                 raise Stop
 
         sheet.sync_once = sync_once
-        sheet.report_tick = lambda: None
+        sheet.report_tick = sheet.weekly_tick = lambda: None
         with (
             mock.patch.object(Spreadsheet, "sleep", sleep),
             mock.patch.object(Spreadsheet.traceback, "print_exc"),
@@ -246,6 +249,54 @@ class InvoiceTickTest(unittest.TestCase):
         self.calendar.refresh_invoice.side_effect = lambda event: (event, None)
         self.sheet.invoice_tick(self.NOW + datetime.timedelta(minutes=10))
         self.assertFalse(self.sheet.invoice_alerted)
+
+
+THURSDAY = datetime.datetime(2026, 10, 1, 10, 0)
+NEXT_MONDAY = datetime.datetime(2026, 10, 5)
+
+
+class WeeklyTickTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        patcher = mock.patch.object(Weekly, "SENT_PATH", folder.name + "/data/weekly_rents_sent")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sheet = bare_sheet()
+        self.calendar = mock.Mock()
+        self.calendar.list_events.return_value = ["event"]
+        patcher = mock.patch.object(Spreadsheet, "Calendar", return_value=self.calendar)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_due_week(self):
+        self.assertIsNone(Weekly.due_week(THURSDAY - datetime.timedelta(minutes=1)))
+        self.assertIsNone(Weekly.due_week(datetime.datetime(2026, 9, 30, 12, 0)))
+        self.assertEqual(Weekly.due_week(THURSDAY), NEXT_MONDAY)
+        # Catch-up after downtime, until Sunday
+        self.assertEqual(Weekly.due_week(datetime.datetime(2026, 10, 4, 23, 59)), NEXT_MONDAY)
+        self.assertIsNone(Weekly.due_week(datetime.datetime(2026, 10, 5, 12, 0)))
+
+    def test_sends_once_even_after_restart(self):
+        self.sheet.weekly_tick(THURSDAY)
+        self.sheet.weekly_tick(THURSDAY + datetime.timedelta(seconds=30))
+        bare_sheet().weekly_tick(THURSDAY + datetime.timedelta(hours=2))
+        self.calendar.list_events.assert_called_once_with(
+            NEXT_MONDAY, NEXT_MONDAY + datetime.timedelta(days=7)
+        )
+        self.sheet.notifier.weekly_rents.assert_called_once_with(NEXT_MONDAY, ["event"])
+        self.sheet.weekly_tick(THURSDAY + datetime.timedelta(days=7))
+        self.assertEqual(self.sheet.notifier.weekly_rents.call_count, 2)
+
+    def test_failure_alerts_once_and_retries(self):
+        self.calendar.list_events.side_effect = TimeoutError("down")
+        with mock.patch.object(Spreadsheet.traceback, "print_exc"):
+            self.sheet.weekly_tick(THURSDAY)
+            self.sheet.weekly_tick(THURSDAY + datetime.timedelta(seconds=30))
+        self.sheet.notifier.weekly_rents_failed.assert_called_once()
+        self.calendar.list_events.side_effect = None
+        self.sheet.weekly_tick(THURSDAY + datetime.timedelta(minutes=1))
+        self.sheet.notifier.weekly_rents.assert_called_once()
 
 
 if __name__ == "__main__":

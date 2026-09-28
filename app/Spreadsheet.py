@@ -5,6 +5,7 @@ from time import sleep
 import Dates
 import Report
 import Robokassa
+import Weekly
 from Calendar import Calendar, EventExists
 from GoogleApi import GoogleApi, read_secret
 from googleapiclient.discovery import build
@@ -25,6 +26,7 @@ class Spreadsheets(GoogleApi):
         # Receives new_booking / duplicate_booking / row_error / sync_failed / sync_recovered
         # and monthly_report / report_exists / report_failed
         # and invoice_paid / invoice_expired / invoice_check_failed
+        # and weekly_rents / weekly_rents_failed
         self.notifier = notifier
         # Month of the last automatic report handled, and of the last failure alert
         self.report_done = None
@@ -32,6 +34,8 @@ class Spreadsheets(GoogleApi):
         # Time of the last invoice check; whether its failure was already reported
         self.invoice_checked = None
         self.invoice_alerted = False
+        # Monday of the week whose digest failure was already reported
+        self.weekly_alerted = None
 
     # Функция обращения к гугл таблице и получения списка событий
     def get_applications(self) -> list:
@@ -150,6 +154,23 @@ class Spreadsheets(GoogleApi):
             self.invoice_alerted = True
             self.notify("invoice_check_failed", failure)
 
+    def weekly_tick(self, now=None):
+        # Called every pass; sends next week's rents once a week (see Weekly.due_week)
+        due = Weekly.due_week(now or Dates.now())
+        if due is None or due == Weekly.last_sent():
+            return
+        try:
+            events = Calendar().list_events(due, due + datetime.timedelta(days=7))
+        except Exception as error:
+            # Retried on the next pass, alerted once per week; not counted as a sync failure
+            traceback.print_exc()
+            if due != self.weekly_alerted:
+                self.weekly_alerted = due
+                self.notify("weekly_rents_failed", error)
+            return
+        self.notify("weekly_rents", due, events)
+        Weekly.mark_sent(due)
+
     @staticmethod
     def row_text(application):
         return (
@@ -226,4 +247,5 @@ class Spreadsheets(GoogleApi):
                     self.notify("sync_failed", error)
             self.report_tick()
             self.invoice_tick()
+            self.weekly_tick()
             sleep(30)
