@@ -7,6 +7,7 @@ import httplib2
 from googleapiclient.errors import HttpError
 from support import timed_event, use_tariffs
 
+import Robokassa
 from Calendar import Calendar
 
 START, END = "2026-09-23T19:30:00+03:00", "2026-09-23T23:30:00+03:00"
@@ -98,10 +99,21 @@ class ConfirmDeleteTest(MockedCalendar):
         self.assertNotIn("id", restore["body"])
 
     def test_confirmed_booking_is_left_alone(self):
-        self.events.get.return_value.execute.return_value = booking(summary="Иван")
+        event = booking(summary="Иван")
+        event["description"] += "public: yes\n"
+        self.events.get.return_value.execute.return_value = event
         _, changed = self.calendar.confirm_event("cb1")
         self.assertFalse(changed)
         self.assertEqual(self.calls(), [("get", "tech")])
+
+    def test_manual_booking_without_mark_is_published(self):
+        # e.g. an event made by hand in the calendar and then paid
+        manual = timed_event(START, END, summary="Анна", event_id="m1")
+        self.events.get.return_value.execute.return_value = manual
+        _, changed = self.calendar.confirm_event("m1")
+        self.assertTrue(changed)
+        self.assertEqual(self.calls(), [("get", "tech"), ("insert", "public"), ("patch", "tech")])
+        self.assertEqual(self.events.patch.call_args.kwargs["body"]["description"], "public: yes\n")
 
     def test_delete_removes_public_copy_first(self):
         self.events.delete.return_value.execute.side_effect = [http_error(404), None]
@@ -117,6 +129,28 @@ class ConfirmDeleteTest(MockedCalendar):
         with self.assertRaises(HttpError):
             self.calendar.delete_event("cb1")
         self.assertEqual(self.calls(), [("delete", "public")])
+
+
+class PriceTest(MockedCalendar):
+    def test_price_updates_the_visible_line_too(self):
+        self.events.get.return_value.execute.return_value = booking()
+        self.calendar.set_event_summ("cb1", 15000)
+        self.assertEqual(
+            self.events.patch.call_args.kwargs["body"],
+            {
+                "extendedProperties": {"private": {"summ": "15000"}},
+                "description": "type: automated\ntg: @ivan\npeople: 5\nsumm: 15000\n",
+            },
+        )
+
+    def test_manual_description_is_left_alone(self):
+        manual = timed_event(START, END, summary="Анна", description="@anna\nзвонила")
+        self.events.get.return_value.execute.return_value = manual
+        self.calendar.set_event_summ("e1", 9000)
+        self.assertEqual(
+            self.events.patch.call_args.kwargs["body"],
+            {"extendedProperties": {"private": {"summ": "9000"}}},
+        )
 
 
 class MoveTest(MockedCalendar):
@@ -147,6 +181,116 @@ class MoveTest(MockedCalendar):
         self.calendar.move_event("cb1", *self.NEW)
         self.assertEqual(self.calls(), [("get", "tech"), ("patch", "tech")])
         self.assertNotIn("extendedProperties", self.events.patch.call_args.kwargs["body"])
+
+
+def invoiced(status="NotPaid"):
+    event = booking(summary="Иван")
+    event["extendedProperties"]["private"].update(
+        invoice_id="inv1", invoice_status=status, invoice_summ="22000", invoice_test="1"
+    )
+    return event
+
+
+class InvoiceTest(MockedCalendar):
+    def setUp(self):
+        super().setUp()
+        self.events.patch.return_value.execute.side_effect = lambda **_: invoiced(
+            self.events.patch.call_args.kwargs["body"]["extendedProperties"]["private"][
+                "invoice_status"
+            ]
+        )
+        self.calendar.confirm_event = mock.Mock()
+        self.robokassa = {}
+        for name in ("invoice_status", "deactivate"):
+            patcher = mock.patch.object(Robokassa, name)
+            self.robokassa[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_invoice_is_saved_in_private_properties(self):
+        self.events.patch.return_value.execute.side_effect = None
+        self.calendar.set_invoice(
+            "cb1",
+            {
+                "id": "inv1",
+                "inv_id": 123285133,
+                "url": "https://pay/inv1",
+                "summ": 22000,
+                "expires": datetime.datetime(2026, 10, 4, 12),
+                "test": True,
+            },
+        )
+        self.assertEqual(
+            self.events.patch.call_args.kwargs["body"],
+            {
+                "extendedProperties": {
+                    "private": {
+                        "invoice_id": "inv1",
+                        "invoice_number": "123285133",
+                        "invoice_url": "https://pay/inv1",
+                        "invoice_status": "NotPaid",
+                        "invoice_summ": "22000",
+                        "invoice_expires": "2026-10-04T12:00:00+03:00",
+                        "invoice_test": "1",
+                    }
+                }
+            },
+        )
+
+    def test_pending_invoices_are_filtered_by_status(self):
+        self.events.list.return_value.execute.return_value = {
+            "items": [invoiced(), dict(invoiced(), status="cancelled")]
+        }
+        self.assertEqual(len(self.calendar.pending_invoices()), 1)
+        self.assertEqual(
+            self.events.list.call_args.kwargs["privateExtendedProperty"], "invoice_status=NotPaid"
+        )
+
+    def test_refresh_saves_only_a_change(self):
+        self.robokassa["invoice_status"].return_value = "NotPaid"
+        self.assertEqual(self.calendar.refresh_invoice(invoiced())[1], None)
+        self.events.patch.assert_not_called()
+        self.robokassa["invoice_status"].return_value = "Paid"
+        event, status = self.calendar.refresh_invoice(invoiced())
+        self.assertEqual(
+            (status, event["extendedProperties"]["private"]["invoice_status"]), ("Paid", "Paid")
+        )
+
+    def test_payment_confirms_booking_before_saving_status(self):
+        self.robokassa["invoice_status"].return_value = "Paid"
+        self.calendar.confirm_event.side_effect = TimeoutError("public calendar down")
+        with self.assertRaises(TimeoutError):
+            self.calendar.refresh_invoice(invoiced())
+        # Still NotPaid in the calendar, so the next check retries
+        self.events.patch.assert_not_called()
+        self.calendar.confirm_event.side_effect = None
+        self.calendar.refresh_invoice(invoiced())
+        self.calendar.confirm_event.assert_called_with("cb1")
+        self.events.patch.assert_called_once()
+
+    def test_expired_invoice_does_not_confirm(self):
+        self.robokassa["invoice_status"].return_value = "Expired"
+        self.calendar.refresh_invoice(invoiced())
+        self.calendar.confirm_event.assert_not_called()
+
+    def test_close_deactivates_unpaid_invoice(self):
+        self.robokassa["invoice_status"].return_value = "NotPaid"
+        _, status = self.calendar.close_invoice(invoiced())
+        self.assertEqual(status, Robokassa.CANCELLED)
+        self.robokassa["deactivate"].assert_called_once_with("inv1", True)
+
+    def test_test_invoice_after_going_live_is_cancelled_quietly(self):
+        self.robokassa["invoice_status"].side_effect = Robokassa.ModeMismatch("mode")
+        _, status = self.calendar.refresh_invoice(invoiced())
+        self.assertEqual(status, Robokassa.CANCELLED)
+        _, status = self.calendar.close_invoice(invoiced())
+        self.assertEqual(status, Robokassa.CANCELLED)
+        self.robokassa["deactivate"].assert_not_called()
+
+    def test_close_keeps_a_paid_invoice(self):
+        self.robokassa["invoice_status"].return_value = "Paid"
+        _, status = self.calendar.close_invoice(invoiced())
+        self.assertEqual(status, "Paid")
+        self.robokassa["deactivate"].assert_not_called()
 
 
 if __name__ == "__main__":

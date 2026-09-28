@@ -1,8 +1,10 @@
+import datetime
 import traceback
 from time import sleep
 
 import Dates
 import Report
+import Robokassa
 from Calendar import Calendar, EventExists
 from GoogleApi import GoogleApi, read_secret
 from googleapiclient.discovery import build
@@ -15,16 +17,21 @@ class Spreadsheets(GoogleApi):
     PROCESSED_COLUMN = "P"
     # ~1.5 minutes of failed passes before alerting, so a single network blip stays quiet
     ALERT_AFTER_FAILURES = 3
+    INVOICE_CHECK_INTERVAL = datetime.timedelta(minutes=5)
 
     def __init__(self, notifier=None):
         super().__init__()
         self.SPREADSHEET_ID = read_secret("spreadsheet_id")
         # Receives new_booking / duplicate_booking / row_error / sync_failed / sync_recovered
         # and monthly_report / report_exists / report_failed
+        # and invoice_paid / invoice_expired / invoice_check_failed
         self.notifier = notifier
         # Month of the last automatic report handled, and of the last failure alert
         self.report_done = None
         self.report_alerted = None
+        # Time of the last invoice check; whether its failure was already reported
+        self.invoice_checked = None
+        self.invoice_alerted = False
 
     # Функция обращения к гугл таблице и получения списка событий
     def get_applications(self) -> list:
@@ -110,6 +117,39 @@ class Spreadsheets(GoogleApi):
             # An existing sheet is never overwritten; most likely made earlier by /monthly_report
             self.notify("report_exists", title)
 
+    def invoice_tick(self, now=None):
+        # Payment status comes by polling: the bot has no HTTP server for Robokassa to call
+        now = now or Dates.now()
+        if not Robokassa.configured() or (
+            self.invoice_checked and now - self.invoice_checked < self.INVOICE_CHECK_INTERVAL
+        ):
+            return
+        self.invoice_checked = now
+        failure = None
+        try:
+            calendar = Calendar()
+            events = calendar.pending_invoices()
+        except Exception as error:
+            traceback.print_exc()
+            events, failure = [], error
+        for event in events:
+            # One broken invoice must not hide the payments of the others
+            try:
+                event, status = calendar.refresh_invoice(event)
+            except Exception as error:
+                traceback.print_exc()
+                failure = error
+                continue
+            if status == Robokassa.PAID:
+                self.notify("invoice_paid", event)
+            elif status == Robokassa.EXPIRED:
+                self.notify("invoice_expired", event)
+        if failure is None:
+            self.invoice_alerted = False
+        elif not self.invoice_alerted:
+            self.invoice_alerted = True
+            self.notify("invoice_check_failed", failure)
+
     @staticmethod
     def row_text(application):
         return (
@@ -185,4 +225,5 @@ class Spreadsheets(GoogleApi):
                 if failures == self.ALERT_AFTER_FAILURES:
                     self.notify("sync_failed", error)
             self.report_tick()
+            self.invoice_tick()
             sleep(30)

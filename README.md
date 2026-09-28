@@ -70,6 +70,7 @@ All files in `secrets/` are gitignored. Never commit them.
 | `secrets/spreadsheet_id` | The Google Sheet ID (the long part of its URL) |
 | `secrets/calendar_id` | Target calendar ID |
 | `secrets/public_calendar_id` | Public calendar ID (confirmed bookings, name and time only) |
+| `secrets/robokassa.json` | Optional. Robokassa credentials for booking invoices; without it there is no 💳 button |
 | `secrets/service_account.json` | Service account key from step 1 |
 
 ### 3. Run locally
@@ -90,7 +91,7 @@ Build the image on the server itself (the Dockerfile uses `python:3.12-alpine`).
 
 ```
 sudo mkdir -p /srv/calendarbot/secrets /srv/calendarbot/data
-# copy the 6 secret files into /srv/calendarbot/secrets/
+# copy the secret files into /srv/calendarbot/secrets/
 
 git clone https://github.com/Krylovv/CalendarBot.git ~/CalendarBot
 cd ~/CalendarBot && docker build -t calendarbot .
@@ -142,6 +143,7 @@ app/Calendar.py     Google Calendar access
 app/Parser.py       booking parsing and pricing
 app/Income.py       monthly income report
 app/Report.py       monthly report sheet
+app/Robokassa.py    Robokassa invoices: create, check status, deactivate
 app/Tariffs.py      tariffs storage
 app/Dates.py        Moscow-time helpers
 tests/              unit tests

@@ -18,6 +18,7 @@ from Bot import (
     booking_card,
     describe_error,
     format_event,
+    invoice_message,
     move_preview,
     report_text,
     split_message,
@@ -202,6 +203,149 @@ class MoveTest(unittest.TestCase):
             self.assertEqual(bot.handle_move_action(call), "Перенесено")
             self.assertEqual(bot.handle_move_action(call), "Кнопка устарела")
         calendar.return_value.move_event.assert_called_once_with("cb1", self.START, self.END)
+
+
+def with_invoice(event, status="NotPaid", summ="18000", test="1"):
+    event["extendedProperties"]["private"].update(
+        invoice_id="inv1",
+        invoice_number="123285133",
+        invoice_url="https://pay/inv1",
+        invoice_status=status,
+        invoice_summ=summ,
+        invoice_expires="2026-10-04T12:00:00+03:00",
+        invoice_test=test,
+    )
+    return event
+
+
+class InvoiceTest(unittest.TestCase):
+    def setUp(self):
+        use_tariffs(self)
+        self.bot = Bot.__new__(Bot)
+        self.bot.callback_ids, self.bot.ids = {}, set()
+        self.bot.bot = mock.Mock()
+        self.calendar = mock.Mock()
+        self.patch("Bot.Robokassa.configured", return_value=True)
+        self.create = self.patch("Bot.Robokassa.create_invoice")
+        self.deactivate = self.patch("Bot.Robokassa.deactivate")
+
+    def patch(self, target, **kwargs):
+        patcher = mock.patch(target, **kwargs)
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def call(self, action="iv"):
+        return SimpleNamespace(
+            data=f"bk:{action}:cb1",
+            message=SimpleNamespace(chat=SimpleNamespace(id=1), message_id=2, text="карточка"),
+            from_user=SimpleNamespace(first_name="Аня"),
+        )
+
+    def buttons(self, event):
+        markup = self.bot.booking_markup(event)
+        return [key.text for row in markup.keyboard for key in row]
+
+    def sent(self):
+        return [call.args[1] for call in self.bot.bot.send_message.call_args_list]
+
+    def test_card_and_forwardable_message(self):
+        event = with_invoice(bot_booking())
+        self.assertIn(
+            "💳 Счёт №123285133 (тест) на 18 000 ₽: не оплачен (до 04.10 12:00)",
+            booking_card(event),
+        )
+        self.assertEqual(
+            invoice_message(event),
+            "По стоимости у вас получится 18 000 ₽\nПредоплата: https://pay/inv1",
+        )
+        self.assertNotIn("@ivan", invoice_message(event))
+
+    def test_button_needs_config_sum_and_unpaid_invoice(self):
+        self.assertIn("💳 Счёт", self.buttons(bot_booking()))
+        self.assertNotIn("💳 Счёт", self.buttons(bot_booking(summ="0")))
+        self.assertNotIn("💳 Счёт", self.buttons(with_invoice(bot_booking(), "Paid")))
+        with mock.patch("Bot.Robokassa.configured", return_value=False):
+            self.assertNotIn("💳 Счёт", self.buttons(bot_booking()))
+
+    def test_issue_saves_and_sends_link(self):
+        self.calendar.find_event.return_value = bot_booking()
+        self.create.return_value = {"id": "inv1", "test": True}
+        self.calendar.set_invoice.return_value = with_invoice(bot_booking())
+        with mock.patch("Bot.Calendar", return_value=self.calendar):
+            self.assertEqual(self.bot.handle_booking_action(self.call()), "Счёт выставлен")
+        self.create.assert_called_once_with(18000, "Аренда зала 23.09.2026 19:30–23:30")
+        self.calendar.set_invoice.assert_called_once_with("cb1", {"id": "inv1", "test": True})
+        self.assertIn("https://pay/inv1", self.sent()[0])
+
+    def test_repeated_tap_resends_the_same_link(self):
+        event = with_invoice(bot_booking())
+        self.calendar.find_event.return_value = event
+        self.calendar.refresh_invoice.return_value = (event, None)
+        with mock.patch("Bot.Calendar", return_value=self.calendar):
+            self.assertEqual(self.bot.handle_booking_action(self.call()), "Счёт уже выставлен")
+        self.create.assert_not_called()
+        self.assertIn("https://pay/inv1", self.sent()[0])
+
+    def test_expired_invoice_is_replaced(self):
+        event = with_invoice(bot_booking())
+        self.calendar.find_event.return_value = event
+        self.calendar.refresh_invoice.return_value = (
+            with_invoice(bot_booking(), "Expired"),
+            "Expired",
+        )
+        self.create.return_value = {"id": "inv2", "test": True}
+        self.calendar.set_invoice.return_value = event
+        with mock.patch("Bot.Calendar", return_value=self.calendar):
+            self.assertEqual(self.bot.handle_booking_action(self.call()), "Счёт выставлен")
+        self.calendar.set_invoice.assert_called_once_with("cb1", {"id": "inv2", "test": True})
+
+    def test_unsaved_invoice_is_deactivated(self):
+        self.calendar.find_event.return_value = bot_booking()
+        self.create.return_value = {"id": "inv1", "test": True}
+        self.calendar.set_invoice.side_effect = TimeoutError("down")
+        with (
+            mock.patch("Bot.Calendar", return_value=self.calendar),
+            self.assertRaises(TimeoutError),
+        ):
+            self.bot.handle_booking_action(self.call())
+        self.deactivate.assert_called_once_with("inv1", True)
+
+    def test_delete_cancels_unpaid_invoice_first(self):
+        event = with_invoice(bot_booking())
+        self.calendar.find_event.return_value = event
+        self.calendar.close_invoice.return_value = (event, "Cancelled")
+        with mock.patch("Bot.Calendar", return_value=self.calendar):
+            self.assertEqual(self.bot.handle_booking_action(self.call("rmy")), "Событие удалено")
+        self.assertEqual(
+            [name for name, _, _ in self.calendar.method_calls],
+            ["find_event", "close_invoice", "delete_event"],
+        )
+
+    def test_delete_stops_when_invoice_was_just_paid(self):
+        self.calendar.find_event.return_value = with_invoice(bot_booking())
+        paid = with_invoice(bot_booking(), "Paid")
+        self.calendar.close_invoice.return_value = (paid, "Paid")
+        with mock.patch("Bot.Calendar", return_value=self.calendar):
+            self.assertEqual(self.bot.handle_booking_action(self.call("rmy")), "Счёт оплачен")
+        self.calendar.delete_event.assert_not_called()
+
+    def test_changed_sum_cancels_unpaid_invoice(self):
+        event = with_invoice(bot_booking(summ="15000"))
+        self.calendar.close_invoice.return_value = (event, "Cancelled")
+        _, note = self.bot.invoice_after_summ_change(self.calendar, event)
+        self.assertEqual(note, "💳 Сумма изменилась, старый счёт отменён: выставьте новый")
+        self.calendar.close_invoice.assert_called_once()
+
+    def test_changed_sum_after_payment_is_flagged(self):
+        event = with_invoice(bot_booking(summ="15000"), "Paid")
+        _, note = self.bot.invoice_after_summ_change(self.calendar, event)
+        self.assertIn("уже оплачен", note)
+        self.calendar.close_invoice.assert_not_called()
+
+    def test_same_sum_keeps_invoice(self):
+        _, note = self.bot.invoice_after_summ_change(self.calendar, with_invoice(bot_booking()))
+        self.assertIsNone(note)
+        self.calendar.close_invoice.assert_not_called()
 
 
 if __name__ == "__main__":

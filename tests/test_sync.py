@@ -17,6 +17,7 @@ def bare_sheet():
     sheet.SPREADSHEET_ID = "test"
     sheet.notifier = mock.Mock()
     sheet.report_done = sheet.report_alerted = None
+    sheet.invoice_checked, sheet.invoice_alerted = None, False
     return sheet
 
 
@@ -188,6 +189,63 @@ class ReportTickTest(unittest.TestCase):
         self.assertEqual(self.sheet.batch_update.call_count, 3)
         calls = [call[0] for call in self.sheet.notifier.method_calls]
         self.assertEqual(calls, ["report_failed", "monthly_report"])
+
+
+class InvoiceTickTest(unittest.TestCase):
+    NOW = datetime.datetime(2026, 9, 27, 12)
+
+    def setUp(self):
+        self.sheet = bare_sheet()
+        self.calendar = mock.Mock()
+        self.calendar.pending_invoices.return_value = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+        self.statuses = {"a": "Paid", "b": None, "c": "Expired"}
+        self.calendar.refresh_invoice.side_effect = lambda event: (
+            event,
+            self.statuses[event["id"]],
+        )
+        for target, value in ((Spreadsheet, "Calendar"), (Spreadsheet.Robokassa, "configured")):
+            patcher = mock.patch.object(target, value)
+            patcher.start().return_value = self.calendar if value == "Calendar" else True
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(Spreadsheet.traceback, "print_exc")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def calls(self):
+        return [(name, args) for name, args, _ in self.sheet.notifier.method_calls]
+
+    def test_reports_paid_and_expired(self):
+        self.sheet.invoice_tick(self.NOW)
+        self.assertEqual(
+            self.calls(), [("invoice_paid", ({"id": "a"},)), ("invoice_expired", ({"id": "c"},))]
+        )
+
+    def test_checks_every_five_minutes(self):
+        for minutes in (0, 1, 4, 5):
+            self.sheet.invoice_tick(self.NOW + datetime.timedelta(minutes=minutes))
+        self.assertEqual(self.calendar.pending_invoices.call_count, 2)
+
+    def test_not_configured_is_quiet(self):
+        Spreadsheet.Robokassa.configured.return_value = False
+        self.sheet.invoice_tick(self.NOW)
+        self.calendar.pending_invoices.assert_not_called()
+
+    def test_broken_invoice_does_not_hide_others_and_alerts_once(self):
+        def refresh(event):
+            if event["id"] == "b":
+                raise TimeoutError("down")
+            return event, self.statuses[event["id"]]
+
+        self.calendar.refresh_invoice.side_effect = refresh
+        self.sheet.invoice_tick(self.NOW)
+        self.sheet.invoice_tick(self.NOW + datetime.timedelta(minutes=5))
+        names = [name for name, _ in self.calls()]
+        self.assertEqual(names.count("invoice_check_failed"), 1)
+        self.assertEqual(names.count("invoice_paid"), 2)
+        # A clean pass re-arms the alert
+        self.calendar.refresh_invoice.side_effect = lambda event: (event, None)
+        self.sheet.invoice_tick(self.NOW + datetime.timedelta(minutes=10))
+        self.assertFalse(self.sheet.invoice_alerted)
 
 
 if __name__ == "__main__":

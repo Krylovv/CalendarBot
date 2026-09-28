@@ -7,6 +7,7 @@ import traceback
 import Dates
 import Income
 import Report
+import Robokassa
 import Tariffs
 import telebot
 from Calendar import OVERLAP_NOTE, Calendar, EventExists
@@ -48,6 +49,7 @@ ABOUT = """Что умеет бот
 • О каждой новой аренде бот пишет сюда: время, сумма, пересечения с другими событиями и выход за рабочие часы (10:00–23:00). Кнопки: ✅ Подтвердить — копирует аренду в публичный календарь (только имя и время, без описания), убирает «(не обработана)» и дописывает в описание строку «public: yes»; ❌ Отменить — удаляет событие из обоих календарей; ✏️ Изменить — перенести на другую дату и время или поменять стоимость (например, для скидки).
 • При переносе бот показывает новое время, пересечения и сумму и ждёт подтверждения. Публичная копия переносится тоже. Сумма по тарифу пересчитывается, а изменённая вручную остаётся прежней. Строка в таблице заявок не меняется.
 • В последний день месяца в 21:00 бот создаёт в таблице заявок лист «Месяц год» (имя, дата, сумма, комментарий, 20%, итог). В него попадают подтверждённые аренды (со строкой «public: yes» в описании) и события, созданные вручную: для них сумма по тарифам и комментарий «Не автоматизированная аренда». Готовый лист бот не перезаписывает.
+• 💳 Счёт (если подключена Robokassa и у аренды есть сумма) — бот выставляет счёт на сумму аренды на 7 дней и присылает сообщение со ссылкой: перешлите его арендатору. Повторное нажатие присылает ту же ссылку. После оплаты бот сам подтверждает бронь (как ✅, с копией в публичном календаре) и сообщает «💰 Оплачено» (проверяет раз в 5 минут). При отмене аренды или изменении суммы неоплаченный счёт отменяется.
 • Если строку не удалось разобрать, в колонке P появится «ОШИБКА: …» и придёт сообщение. Исправьте строку и очистите ячейку — бот попробует снова.
 • Повторная заявка на ту же аренду не создаёт второе событие.
 • Если связь с Google пропала дольше чем на полторы минуты, бот предупредит и сообщит, когда всё восстановится.
@@ -176,6 +178,45 @@ def report_text(year, month, title, totals):
     )
 
 
+INVOICE_STATUSES = {
+    Robokassa.NOT_PAID: "не оплачен",
+    Robokassa.PAID: "оплачен",
+    Robokassa.EXPIRED: "истёк",
+    Robokassa.CANCELLED: "отменён",
+}
+
+
+def invoice_summ(invoice):
+    return "?" if invoice["summ"] is None else Income.money(invoice["summ"])
+
+
+def invoice_expires(invoice):
+    try:
+        return f"{Dates.parse_api_time(invoice['expires']):%d.%m %H:%M}"
+    except ValueError:
+        return "?"
+
+
+def invoice_line(event):
+    invoice = Income.invoice(event)
+    if invoice is None:
+        return None
+    test = " (тест)" if invoice["test"] else ""
+    status = INVOICE_STATUSES.get(invoice["status"], invoice["status"])
+    number = f" №{invoice['number']}" if invoice["number"] else ""
+    line = f"💳 Счёт{number}{test} на {invoice_summ(invoice)} ₽: {status}"
+    if invoice["status"] == Robokassa.NOT_PAID:
+        line += f" (до {invoice_expires(invoice)})"
+    return line
+
+
+def invoice_message(event):
+    # Made to be forwarded to the tenant as is: no internal details. Test mode is marked on
+    # the booking card instead
+    invoice = Income.invoice(event)
+    return f"По стоимости у вас получится {invoice_summ(invoice)} ₽\nПредоплата: {invoice['url']}"
+
+
 def booking_card(event, conflicts=()):
     fields = description_fields(event)
     name = Income.strip_untreated(Income.title(event))
@@ -187,6 +228,9 @@ def booking_card(event, conflicts=()):
     summ = Income.recorded_summ(event)
     if summ is not None:
         lines.append(f"Сумма: {Income.money(summ)} ₽")
+    invoice = invoice_line(event)
+    if invoice:
+        lines.append(invoice)
     for other in conflicts:
         lines.append(
             f"⚠️ Пересекается: {Dates.format_span(*Dates.event_bounds(other))} {Income.title(other)}"
@@ -254,7 +298,16 @@ class Bot:
             actions.append(button("✅ Подтвердить", self.event_callback("bk:ok", event["id"])))
         actions.append(button("❌ Отменить", self.event_callback("bk:rm", event["id"])))
         markup.row(*actions)
-        markup.add(button("✏️ Изменить", self.event_callback("bk:ed", event["id"])))
+        edits = [button("✏️ Изменить", self.event_callback("bk:ed", event["id"]))]
+        invoice = Income.invoice(event)
+        if (
+            Robokassa.configured()
+            and Income.recorded_summ(event)
+            and Dates.event_bounds(event)
+            and not (invoice and invoice["status"] == Robokassa.PAID)
+        ):
+            edits.append(button("💳 Счёт", self.event_callback("bk:iv", event["id"])))
+        markup.row(*edits)
         if event.get("htmlLink"):
             markup.add(types.InlineKeyboardButton("Открыть в календаре", url=event["htmlLink"]))
         return markup
@@ -369,6 +422,100 @@ class Bot:
             f"{describe_error(error)}\nБот повторяет попытки каждые 30 секунд."
         )
 
+    def invoice_paid(self, event):
+        self.notify_admins(
+            f"💰 Оплачено: {invoice_summ(Income.invoice(event))} ₽, "
+            "бронь подтверждена и добавлена в публичный календарь\n" + booking_card(event),
+            self.booking_markup(event),
+        )
+
+    def invoice_expired(self, event):
+        self.notify_admins(
+            f"⌛ Счёт на {invoice_summ(Income.invoice(event))} ₽ истёк неоплаченным\n"
+            + booking_card(event),
+            self.booking_markup(event),
+        )
+
+    def invoice_check_failed(self, error):
+        self.notify_admins(
+            f"⚠️ Не удалось проверить оплату счетов: {describe_error(error)}\n"
+            "Бот повторяет попытки каждые 5 минут и не сообщит о проблеме повторно, "
+            "пока проверка не пройдёт успешно."
+        )
+
+    # --- invoices
+
+    def close_invoice(self, calendar, event):
+        # -> (event, status) for an unpaid invoice; a payment found on the way is announced
+        event, status = calendar.close_invoice(event)
+        if status == Robokassa.PAID:
+            self.invoice_paid(event)
+        return event, status
+
+    def issue_invoice(self, call, calendar, event):
+        summ = Income.recorded_summ(event)
+        if not summ:
+            return "Сначала укажите стоимость"
+        invoice = Income.invoice(event)
+        if invoice and invoice["status"] == Robokassa.PAID:
+            return "Счёт уже оплачен"
+        if invoice and invoice["status"] == Robokassa.NOT_PAID:
+            if invoice["summ"] == summ:
+                # A repeated tap resends the link instead of making a second invoice,
+                # unless the invoice was paid or expired since the last check
+                event, status = calendar.refresh_invoice(event)
+                if status is None:
+                    self.bot.send_message(call.message.chat.id, invoice_message(event))
+                    return "Счёт уже выставлен"
+            else:
+                event, status = self.close_invoice(calendar, event)
+            if status == Robokassa.PAID:
+                if invoice["summ"] == summ:
+                    self.invoice_paid(event)
+                return "Счёт уже оплачен"
+        created = Robokassa.create_invoice(
+            summ, Robokassa.invoice_description(*Dates.event_bounds(event))
+        )
+        try:
+            event = calendar.set_invoice(event["id"], created)
+        except Exception:
+            # Unsaved, the invoice would be neither tracked nor shown: don't leave it payable
+            with contextlib.suppress(Exception):
+                Robokassa.deactivate(created["id"], created["test"])
+            raise
+        who = call.from_user.first_name or "без имени"
+        self.append_status(
+            call.message,
+            f"💳 Счёт на {Income.money(summ)} ₽ выставлен ({who})",
+            self.booking_markup(event),
+        )
+        self.bot.send_message(call.message.chat.id, invoice_message(event))
+        return "Счёт выставлен"
+
+    def invoice_after_summ_change(self, calendar, event):
+        # -> (event, note or None). An unpaid invoice for the old sum is cancelled
+        invoice = Income.invoice(event)
+        summ = Income.recorded_summ(event)
+        if invoice is None or invoice["summ"] == summ:
+            return event, None
+        if invoice["status"] == Robokassa.NOT_PAID:
+            try:
+                event, status = self.close_invoice(calendar, event)
+            except Exception:
+                traceback.print_exc()
+                return event, (
+                    "⚠️ Сумма изменилась, но старый счёт отменить не удалось. "
+                    "Нажмите «💳 Счёт», чтобы выставить новый"
+                )
+            if status != Robokassa.PAID:
+                return event, "💳 Сумма изменилась, старый счёт отменён: выставьте новый"
+        if Income.invoice(event)["status"] == Robokassa.PAID:
+            return event, (
+                f"⚠️ Счёт на {invoice_summ(invoice)} ₽ уже оплачен, а сумма теперь "
+                f"{Income.money(summ or 0)} ₽: разницу учтите вручную"
+            )
+        return event, None
+
     # --- booking buttons
 
     def edit_markup(self, event_id):
@@ -378,6 +525,14 @@ class Bot:
             button("💰 Стоимость", self.event_callback("bk:pr", event_id)),
         )
         markup.add(button("« Назад", self.event_callback("bk:keep", event_id)))
+        return markup
+
+    def delete_markup(self, event_id):
+        markup = types.InlineKeyboardMarkup()
+        markup.row(
+            button("🗑 Да, удалить", self.event_callback("bk:rmy", event_id)),
+            button("Нет", self.event_callback("bk:keep", event_id)),
+        )
         return markup
 
     def append_status(self, message, note, reply_markup=None):
@@ -406,12 +561,9 @@ class Bot:
         who = call.from_user.first_name or "без имени"
         if action == "rm":
             # Deleting is irreversible: ask first
-            markup = types.InlineKeyboardMarkup()
-            markup.row(
-                button("🗑 Да, удалить", self.event_callback("bk:rmy", event_id)),
-                button("Нет", self.event_callback("bk:keep", event_id)),
+            self.bot.edit_message_reply_markup(
+                chat_id, message_id, reply_markup=self.delete_markup(event_id)
             )
-            self.bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
             return None
         if action == "ed":
             self.bot.edit_message_reply_markup(
@@ -442,12 +594,30 @@ class Bot:
             )
             return None
         if action == "rmy":
+            invoice = Income.invoice(event)
+            if invoice and invoice["status"] == Robokassa.NOT_PAID:
+                # The tenant must not be able to pay for a cancelled booking
+                event, status = self.close_invoice(calendar, event)
+                if status == Robokassa.PAID:
+                    self.append_status(
+                        call.message,
+                        "💰 Счёт только что оплачен. Если всё равно удалить, "
+                        "деньги нужно вернуть вручную через Robokassa",
+                        self.delete_markup(event_id),
+                    )
+                    return "Счёт оплачен"
             calendar.delete_event(event_id)
-            self.append_status(call.message, f"❌ Отменено, событие удалено ({who})")
+            note = f"❌ Отменено, событие удалено ({who})"
+            invoice = Income.invoice(event)
+            if invoice and invoice["status"] == Robokassa.PAID:
+                note += "\n⚠️ Счёт был оплачен: деньги возвращаются вручную через Robokassa"
+            self.append_status(call.message, note)
             return "Событие удалено"
         bounds = Dates.event_bounds(event)
         if not bounds:
             return "Событие на весь день изменить нельзя"
+        if action == "iv":
+            return self.issue_invoice(call, calendar, event)
         name = Income.strip_untreated(Income.title(event))
         if action == "mv":
             self.ask(
@@ -540,9 +710,12 @@ class Bot:
             self.bot.edit_message_reply_markup(chat_id, message_id)
             return "Событие уже удалено"
         event, conflicts = calendar.move_event(event_id, start, end)
+        event, note = self.invoice_after_summ_change(calendar, event)
         who = call.from_user.first_name or "без имени"
         self.bot.edit_message_text(
-            f"📅 Перенесено ({who})\n" + booking_card(event, conflicts),
+            f"📅 Перенесено ({who})\n"
+            + booking_card(event, conflicts)
+            + (f"\n\n{note}" if note else ""),
             chat_id,
             message_id,
             reply_markup=self.booking_markup(event),
@@ -573,11 +746,14 @@ class Bot:
                 self.bot.reply_to(message, "Событие уже удалено из календаря")
                 return
             event = calendar.set_event_summ(event_id, value)
+            event, note = self.invoice_after_summ_change(calendar, event)
             saved = "бесплатно" if value == 0 else Income.money(value) + " ₽"
             who = message.from_user.first_name or "без имени"
             self.bot.reply_to(
                 message,
-                f"💰 Стоимость изменена: {saved} ({who})\n" + booking_card(event),
+                f"💰 Стоимость изменена: {saved} ({who})\n"
+                + booking_card(event)
+                + (f"\n\n{note}" if note else ""),
                 reply_markup=self.booking_markup(event),
             )
             with contextlib.suppress(Exception):

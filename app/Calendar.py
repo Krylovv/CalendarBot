@@ -3,6 +3,7 @@ import hashlib
 
 import Dates
 import Income
+import Robokassa
 from GoogleApi import GoogleApi, read_secret
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -156,7 +157,8 @@ class Calendar(GoogleApi):
     def confirm_event(self, event_id):
         # Returns (event, changed); confirming twice is harmless
         event = self.get_event(event_id)
-        if not Income.is_untreated(event):
+        # A booking made by hand has no untreated mark but still needs publishing once paid
+        if not Income.is_untreated(event) and Income.is_published(event):
             return event, False
         # Publish first: if that fails, the booking stays untreated and can be confirmed again
         self.publish_event(event)
@@ -225,13 +227,97 @@ class Calendar(GoogleApi):
         return event, conflicts
 
     def set_event_summ(self, event_id, summ):
+        # The hidden field is what the bot counts; the "summ: N" line of a bot description is
+        # what people see in the calendar, so it must follow. Other descriptions are left alone
+        event = self.get_event(event_id)
         body = {"extendedProperties": {"private": {"summ": str(summ)}}}
+        description = event.get("description") or ""
+        updated = Income.set_description_field(description, "summ", summ)
+        if updated != description:
+            body["description"] = updated
         return (
             self.service()
             .events()
             .patch(calendarId=self.CALENDAR_ID, eventId=event_id, body=body)
             .execute(num_retries=3)
         )
+
+    def patch_private(self, event_id, private):
+        body = {"extendedProperties": {"private": private}}
+        return (
+            self.service()
+            .events()
+            .patch(calendarId=self.CALENDAR_ID, eventId=event_id, body=body)
+            .execute(num_retries=3)
+        )
+
+    def set_invoice(self, event_id, invoice):
+        # Replaces the booking's previous invoice, if any
+        return self.patch_private(
+            event_id,
+            {
+                "invoice_id": invoice["id"],
+                "invoice_number": str(invoice["inv_id"]),
+                "invoice_url": invoice["url"],
+                "invoice_status": Robokassa.NOT_PAID,
+                "invoice_summ": str(invoice["summ"]),
+                "invoice_expires": Dates.rfc3339(invoice["expires"]),
+                "invoice_test": "1" if invoice["test"] else "0",
+            },
+        )
+
+    def set_invoice_status(self, event_id, status):
+        return self.patch_private(event_id, {"invoice_status": status})
+
+    def refresh_invoice(self, event):
+        # -> (event, new status, or None if unchanged)
+        invoice = Income.invoice(event)
+        try:
+            status = Robokassa.invoice_status(invoice["id"], invoice["test"])
+        except Robokassa.ModeMismatch:
+            # A test invoice left from before going live (or the reverse): it can't be checked
+            # any more, and real money can't be paid by it
+            status = Robokassa.CANCELLED
+        if status == invoice["status"]:
+            return event, None
+        if status == Robokassa.PAID:
+            # A paid booking is confirmed and goes to the public calendar. First: if that fails,
+            # the invoice stays NotPaid here and the next check retries
+            self.confirm_event(event["id"])
+        return self.set_invoice_status(event["id"], status), status
+
+    def close_invoice(self, event):
+        # Stops an unpaid invoice from being paid -> (event, status). Checked first: an invoice
+        # paid meanwhile comes back as Paid and stays so
+        event, status = self.refresh_invoice(event)
+        if status is not None:
+            return event, status
+        invoice = Income.invoice(event)
+        Robokassa.deactivate(invoice["id"], invoice["test"])
+        return self.set_invoice_status(event["id"], Robokassa.CANCELLED), Robokassa.CANCELLED
+
+    def pending_invoices(self):
+        # Bookings whose invoice may still be paid, at any date: payment can come after the rent
+        service = self.service()
+        events, page_token = [], None
+        while True:
+            result = (
+                service.events()
+                .list(
+                    calendarId=self.CALENDAR_ID,
+                    privateExtendedProperty=f"invoice_status={Robokassa.NOT_PAID}",
+                    maxResults=2500,
+                    singleEvents=True,
+                    pageToken=page_token,
+                )
+                .execute(num_retries=3)
+            )
+            events += [
+                event for event in result.get("items", []) if event.get("status") != "cancelled"
+            ]
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                return events
 
     # Функция получения аренд следующей недели
     def get_events_for_next_week(self):

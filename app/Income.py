@@ -81,6 +81,26 @@ def summ_after_move(event, start, end):
     return Parser.get_summ(start, end)
 
 
+def invoice(event):
+    # The booking's last invoice as saved by Calendar.set_invoice, or None
+    private = private_props(event)
+    if not private.get("invoice_id"):
+        return None
+    try:
+        summ = int(private.get("invoice_summ", ""))
+    except ValueError:
+        summ = None
+    return {
+        "id": private["invoice_id"],
+        "number": private.get("invoice_number", ""),
+        "url": private.get("invoice_url", ""),
+        "status": private.get("invoice_status", ""),
+        "summ": summ,
+        "expires": private.get("invoice_expires", ""),
+        "test": private.get("invoice_test") == "1",
+    }
+
+
 def set_description_field(description, key, value):
     # Rewrites a "key: value" line of a bot description; other descriptions are left alone
     pattern = re.compile(rf"^{re.escape(key)}: .*$", re.MULTILINE)
